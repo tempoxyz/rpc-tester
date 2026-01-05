@@ -10,6 +10,7 @@ use serde_json::Value;
 pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
     let mut passed = true;
     println!("\n--- RPC Method Test Results ---");
+    println!("  (expected = rpc2, actual = rpc1)\n");
 
     for (title, results) in results_by_block {
         let mut passed_title = true;
@@ -17,7 +18,7 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
         for (name, result) in results {
             match result {
                 Ok(_) => {}
-                Err(TestError::Diff { rpc1, rpc2 }) => {
+                Err(TestError::Diff { rpc1, rpc2, args }) => {
                     // While results are different, we only report it as error if __RPC1__ is
                     // missing/mismatching any element against RPC2.
                     if let Some(diffs) = verify_missing_or_mismatch(rpc1, rpc2) {
@@ -25,7 +26,10 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
                             passed_title = false;
                             println!("\n{title} ❌");
                         }
-                        println!("    {name}: ❌ Failure ");
+                        println!("    {name}: ❌ Failure");
+                        if let Some(args) = args {
+                            println!("      args: {args}");
+                        }
                         println!("{diffs}");
                     }
                 }
@@ -70,7 +74,8 @@ fn verify_missing_or_mismatch(rpc1: Value, rpc2: Value) -> Option<String> {
             .downcast_ref::<&str>()
             .map(|s| s.to_string())
             .unwrap_or_else(|| err.downcast_ref::<String>().cloned().expect("should"))
-            .replace("actual", "rpc1");
+            .replace("actual", "actual (rpc1)")
+            .replace("expected", "expected (rpc2)");
         return Some(err_msg);
     }
     None
