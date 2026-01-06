@@ -40,6 +40,11 @@ pub struct CliArgs {
     #[arg(long, value_name = "ALL_TXES", default_value = "false")]
     pub use_all_txes: bool,
 
+    /// Skip extended eth methods not supported by all clients (e.g.,
+    /// `eth_getRawTransactionByBlockNumberAndIndex`).
+    #[arg(long)]
+    pub skip_extended_eth: bool,
+
     /// Maximum time to wait for syncing in seconds
     #[arg(long, value_name = "TIMEOUT", default_value = "300")]
     pub timeout: u64,
@@ -71,6 +76,7 @@ async fn main() -> eyre::Result<()> {
         .with_tracing(args.use_tracing)
         .with_reth(args.use_reth)
         .with_all_txes(args.use_all_txes)
+        .skip_extended_eth(args.skip_extended_eth)
         .with_rate_limit(args.rate_limit)
         .build()
         .run(block_range)

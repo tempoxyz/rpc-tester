@@ -44,6 +44,9 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Whether to call rpc transaction methods for every transaction. Otherwise, just the first of
     /// the block.
     use_all_txes: bool,
+    /// Whether to skip extended eth methods not supported by all clients (e.g.,
+    /// `eth_getRawTransactionByBlockNumberAndIndex`).
+    skip_extended_eth: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -142,14 +145,7 @@ where
                 let tx_calls = vec![
                     rpc!(self, get_raw_transaction_by_hash, tx_hash),
                     rpc!(self, get_transaction_by_hash, tx_hash),
-                    rpc!(self, get_raw_transaction_by_block_hash_and_index, block_hash, index), /* TODO: Re-check */
                     rpc!(self, get_transaction_by_block_hash_and_index, block_hash, index),
-                    rpc!(
-                        self,
-                        get_raw_transaction_by_block_number_and_index,
-                        block_tag,
-                        index
-                    ),
                     rpc!(self, get_transaction_by_block_number_and_index, block_tag, index),
                     rpc!(self, get_transaction_receipt, tx_hash),
                     rpc_with_block!(self, get_transaction_count, tx_from; block_id),
@@ -157,6 +153,15 @@ where
                     rpc!(self, debug_trace_transaction, tx_hash, tracer_opts),
                 ];
                 tests.extend(tx_calls);
+
+                if !self.skip_extended_eth {
+                    #[rustfmt::skip]
+                    let extended_calls = vec![
+                        rpc!(self, get_raw_transaction_by_block_hash_and_index, block_hash, index),
+                        rpc!(self, get_raw_transaction_by_block_number_and_index, block_tag, index),
+                    ];
+                    tests.extend(extended_calls);
+                }
 
                 if !self.use_all_txes {
                     break;
@@ -291,6 +296,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     /// Whether to call rpc transaction methods for every transaction. Otherwise, just the first of
     /// the block.
     use_all_txes: bool,
+    /// Whether to skip extended eth methods not supported by all clients.
+    skip_extended_eth: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -304,6 +311,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_tracing: false,
             use_reth: false,
             use_all_txes: false,
+            skip_extended_eth: false,
             rate_limit_rps: None,
         }
     }
@@ -327,6 +335,13 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Skips extended eth methods not supported by all clients (e.g.,
+    /// `eth_getRawTransactionByBlockNumberAndIndex`).
+    pub const fn skip_extended_eth(mut self, skip: bool) -> Self {
+        self.skip_extended_eth = skip;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -342,6 +357,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_tracing: self.use_tracing,
             use_reth: self.use_reth,
             use_all_txes: self.use_all_txes,
+            skip_extended_eth: self.skip_extended_eth,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
