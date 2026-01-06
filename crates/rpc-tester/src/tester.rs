@@ -241,6 +241,7 @@ where
     async fn test_rpc_call<'a, F, Fut, T, E>(
         &'a self,
         name: &str,
+        args: Option<String>,
         method_call: F,
     ) -> (MethodName, Result<(), TestError>)
     where
@@ -271,6 +272,7 @@ where
                     Err(TestError::Diff {
                         rpc1: serde_json::to_value(&rpc1).expect("should json"),
                         rpc2: serde_json::to_value(&rpc2).expect("should json"),
+                        args,
                     })
                 }
             }
