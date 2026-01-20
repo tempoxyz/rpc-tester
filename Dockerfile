@@ -1,7 +1,7 @@
 FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
 WORKDIR /app
 
-LABEL org.opencontainers.image.source=https://github.com/ithacaxyz/rpc-tester
+LABEL org.opencontainers.image.source=https://github.com/tempoxyz/rpc-tester
 
 # Builds a cargo-chef plan
 FROM chef AS planner
