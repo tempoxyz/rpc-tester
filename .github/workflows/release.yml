@@ -37,8 +37,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/ithacaxyz/rpc-tester:latest
-            ghcr.io/ithacaxyz/rpc-tester:${{ github.ref_name }}
+            ghcr.io/tempoxyz/rpc-tester:latest
+            ghcr.io/tempoxyz/rpc-tester:${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -56,6 +56,6 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/ithacaxyz/rpc-tester:${{ steps.vars.outputs.sha_short }}
+            ghcr.io/tempoxyz/rpc-tester:${{ steps.vars.outputs.sha_short }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
