@@ -12,6 +12,8 @@ alloy-primitives.workspace = true
 alloy-rpc-types.workspace = true
 alloy-rpc-types-trace.workspace = true
 alloy-provider = { workspace = true, features = ["trace-api", "debug-api"] }
+alloy-json-rpc = "0.11.1"
+alloy-transport = "0.11.1"
 
 assert-json-diff.workspace = true
 eyre.workspace = true

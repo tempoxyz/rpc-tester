@@ -1,6 +1,8 @@
 //! rpc-tester library
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+#[doc(hidden)]
+pub mod get_logs;
 mod tester;
 pub use tester::RpcTester;
 mod report;
@@ -49,6 +51,9 @@ macro_rules! rpc_with_block {
 }
 
 /// Macro to call the `get_logs` rpc method and box the future result.
+///
+/// Uses [`get_logs::get_logs_with_retry`] to automatically handle "max results exceeded" errors
+/// by retrying with the narrower block range suggested in the error message.
 #[macro_export]
 macro_rules! get_logs {
     ($self:expr, $arg:expr) => {{
@@ -58,7 +63,7 @@ macro_rules! get_logs {
             $self
                 .test_rpc_call(stringify!(get_logs), args_str, move |provider: &P| {
                     let filter = filter.clone();
-                    async move { provider.get_logs(&filter).await }
+                    async move { $crate::get_logs::get_logs_with_retry(provider, &filter).await }
                 })
                 .await
         }) as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>

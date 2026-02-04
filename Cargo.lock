@@ -2501,10 +2501,12 @@ dependencies = [
 name = "rpc-tester"
 version = "0.1.0"
 dependencies = [
+ "alloy-json-rpc",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types",
  "alloy-rpc-types-trace",
+ "alloy-transport",
  "assert-json-diff",
  "eyre",
  "futures",
