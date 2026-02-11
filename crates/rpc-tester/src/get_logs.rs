@@ -45,9 +45,8 @@ fn get_logs_paginated<'a, P: Provider<AnyNetwork>>(
                     return Err(e);
                 };
 
-                let Some(chunk_size) = suggested_to
-                    .checked_sub(suggested_from)
-                    .and_then(|d| d.checked_add(1))
+                let Some(chunk_size) =
+                    suggested_to.checked_sub(suggested_from).and_then(|d| d.checked_add(1))
                 else {
                     return Err(e);
                 };
@@ -68,13 +67,9 @@ fn get_logs_paginated<'a, P: Provider<AnyNetwork>>(
                 let mut current_from = original_from;
 
                 while current_from <= original_to {
-                    let current_to = current_from
-                        .saturating_add(chunk_size - 1)
-                        .min(original_to);
-                    let chunk_filter =
-                        filter.clone().from_block(current_from).to_block(current_to);
-                    let chunk_logs =
-                        get_logs_paginated(provider, chunk_filter, depth + 1).await?;
+                    let current_to = current_from.saturating_add(chunk_size - 1).min(original_to);
+                    let chunk_filter = filter.clone().from_block(current_from).to_block(current_to);
+                    let chunk_logs = get_logs_paginated(provider, chunk_filter, depth + 1).await?;
                     all_logs.extend(chunk_logs);
                     current_from = match current_to.checked_add(1) {
                         Some(v) => v,
