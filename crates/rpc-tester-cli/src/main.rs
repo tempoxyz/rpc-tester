@@ -6,7 +6,6 @@ use clap::Parser;
 use rpc_tester::RpcTester;
 use std::{
     ops::RangeInclusive,
-    thread::sleep,
     time::{Duration, Instant},
 };
 use tracing::info;
@@ -89,7 +88,6 @@ pub async fn wait_for_readiness<P: Provider<AnyNetwork>>(
     rpc2: &P,
     block_size_range: u64,
 ) -> eyre::Result<RangeInclusive<u64>> {
-    let sleep = || sleep(Duration::from_secs(5));
     let args = CliArgs::parse();
     let start_time = Instant::now();
     let timeout = Duration::from_secs(args.timeout);
@@ -103,7 +101,7 @@ pub async fn wait_for_readiness<P: Provider<AnyNetwork>>(
             ));
         }
         info!(?sync_info, "rpc1 still syncing");
-        sleep();
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
     // Waits until rpc1 has _mostly_ catch up to rpc2 or beyond
@@ -118,7 +116,6 @@ pub async fn wait_for_readiness<P: Provider<AnyNetwork>>(
             return Ok(range);
         }
         info!(?tip1, ?tip2, "rpc1 is behind rpc2, waiting for it to catch up");
-
-        sleep();
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
