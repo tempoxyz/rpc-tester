@@ -57,6 +57,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
+            ghcr.io/tempoxyz/rpc-tester:latest
             ghcr.io/tempoxyz/rpc-tester:${{ steps.vars.outputs.sha_short }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
