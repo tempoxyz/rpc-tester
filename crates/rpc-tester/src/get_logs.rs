@@ -28,6 +28,9 @@ pub async fn get_logs_with_retry<P: Provider<AnyNetwork>>(
 }
 
 /// Recursively fetches logs, splitting the range when "max results exceeded" is returned.
+///
+/// Uses the server's suggested chunk size as a starting point, but halves it when the suggested
+/// range itself still exceeds the limit.
 fn get_logs_paginated<'a, P: Provider<AnyNetwork>>(
     provider: &'a P,
     filter: Filter,
@@ -45,7 +48,7 @@ fn get_logs_paginated<'a, P: Provider<AnyNetwork>>(
                     return Err(e);
                 };
 
-                let Some(chunk_size) =
+                let Some(suggested_chunk) =
                     suggested_to.checked_sub(suggested_from).and_then(|d| d.checked_add(1))
                 else {
                     return Err(e);
@@ -59,9 +62,20 @@ fn get_logs_paginated<'a, P: Provider<AnyNetwork>>(
                 }
 
                 let original_len = original_to - original_from + 1;
-                if chunk_size >= original_len && depth > 0 {
-                    return Err(e);
-                }
+
+                // If the suggested chunk covers the entire range and we're already in a
+                // recursive call, halve the chunk size instead of giving up. This handles
+                // the case where the server's suggested range itself still exceeds the
+                // max results limit.
+                let chunk_size = if suggested_chunk >= original_len && depth > 0 {
+                    let halved = original_len / 2;
+                    if halved == 0 {
+                        return Err(e);
+                    }
+                    halved
+                } else {
+                    suggested_chunk
+                };
 
                 let mut all_logs = Vec::new();
                 let mut current_from = original_from;
