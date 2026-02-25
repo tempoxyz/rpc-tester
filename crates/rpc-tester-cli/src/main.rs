@@ -35,7 +35,7 @@ pub struct CliArgs {
     #[arg(long, value_name = "TRACING", default_value = "false")]
     pub use_tracing: bool,
 
-    /// Whether to query every transacion from a block or just the first.
+    /// Whether to query every transaction from a block or just the first.
     #[arg(long, value_name = "ALL_TXES", default_value = "false")]
     pub use_all_txes: bool,
 
@@ -69,7 +69,9 @@ async fn main() -> eyre::Result<()> {
         .network::<AnyNetwork>()
         .on_http(args.rpc2);
 
-    let block_range = wait_for_readiness(&rpc1, &rpc2, args.num_blocks).await?;
+    let timeout = Duration::from_secs(args.timeout);
+
+    let block_range = wait_for_readiness(&rpc1, &rpc2, args.num_blocks, timeout).await?;
 
     RpcTester::builder(rpc1, rpc2)
         .with_tracing(args.use_tracing)
@@ -87,17 +89,16 @@ pub async fn wait_for_readiness<P: Provider<AnyNetwork>>(
     rpc1: &P,
     rpc2: &P,
     block_size_range: u64,
+    timeout: Duration,
 ) -> eyre::Result<RangeInclusive<u64>> {
-    let args = CliArgs::parse();
     let start_time = Instant::now();
-    let timeout = Duration::from_secs(args.timeout);
 
     // Waits until it's done syncing
     while let SyncStatus::Info(sync_info) = rpc1.syncing().await? {
         if start_time.elapsed() > timeout {
             return Err(eyre::eyre!(
                 "Timeout waiting for rpc1 to sync after {} seconds",
-                args.timeout
+                timeout.as_secs()
             ));
         }
         info!(?sync_info, "rpc1 still syncing");
