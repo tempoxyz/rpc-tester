@@ -11,7 +11,7 @@ Options:
       --num-blocks <NUM_BLOCKS>  Number of blocks to test from the tip [default: 32]
       --use-reth                 Whether to query reth namespace
       --use-tracing              Whether to query tracing methods
-      --use-all-txes             Whether to query every transacion from a block or just the first
+      --use-all-txes             Whether to query every transaction from a block or just the first
       --rate-limit <RATE_LIMIT>  Maximum requests per second (rate limit)
       --timeout <TIMEOUT>        Maximum time to wait for syncing in seconds [default: 300]
   -h, --help                     Print help
