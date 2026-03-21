@@ -201,7 +201,7 @@ where
         Ok(())
     }
 
-    /// Fetches block and block identifiers from `self.truth`.
+    /// Fetches block and block identifiers from `self.rpc2`.
     async fn fetch_block(
         &self,
         block_number: u64,
