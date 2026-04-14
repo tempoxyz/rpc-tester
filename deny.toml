@@ -2,10 +2,14 @@
 version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    "RUSTSEC-2024-0436", # paste — unmaintained, transitive via alloy-primitives, no fix available
+    "RUSTSEC-2025-0134", # rustls-pemfile — unmaintained, transitive via reqwest, no fix available
+]
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "allow" # workspace path deps have no version
 
 [sources]
 unknown-registry = "deny"
