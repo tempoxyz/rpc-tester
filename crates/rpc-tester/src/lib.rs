@@ -6,6 +6,8 @@ pub mod get_logs;
 mod tester;
 pub use tester::RpcTester;
 mod report;
+mod sampling;
+pub use sampling::{historical_blocks, HISTORICAL_OFFSETS};
 
 /// Equality rpc test error
 enum TestError {

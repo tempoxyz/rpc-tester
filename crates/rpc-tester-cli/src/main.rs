@@ -3,7 +3,7 @@
 use alloy_provider::{network::AnyNetwork, Provider, ProviderBuilder};
 use alloy_rpc_types::SyncStatus;
 use clap::Parser;
-use rpc_tester::RpcTester;
+use rpc_tester::{historical_blocks, RpcTester};
 use std::{
     ops::RangeInclusive,
     time::{Duration, Instant},
@@ -52,6 +52,20 @@ pub struct CliArgs {
     /// If not provided, no rate limiting is applied.
     #[arg(long, value_name = "RATE_LIMIT")]
     pub rate_limit: Option<u32>,
+
+    /// Additionally test log-spaced historical blocks sampled backwards from the tip
+    /// (head-128, head-1024, head-10000, head-100000, head-1000000).
+    ///
+    /// This exercises cold history (static files, pruned tables) that near-tip blocks do not.
+    #[arg(long)]
+    pub historical: bool,
+
+    /// Additional pinned block numbers to test, comma separated.
+    ///
+    /// Useful for chain-specific edge cases such as fork transition blocks or blocks with rare
+    /// transaction types.
+    #[arg(long, value_name = "BLOCKS", value_delimiter = ',')]
+    pub blocks: Vec<u64>,
 }
 
 #[tokio::main]
@@ -71,15 +85,29 @@ async fn main() -> eyre::Result<()> {
 
     let block_range = wait_for_readiness(&rpc1, &rpc2, args.num_blocks).await?;
 
-    RpcTester::builder(rpc1, rpc2)
+    let tester = RpcTester::builder(rpc1, rpc2)
         .with_tracing(args.use_tracing)
         .with_reth(args.use_reth)
         .with_all_txes(args.use_all_txes)
         .skip_extended_eth(args.skip_extended_eth)
         .with_rate_limit(args.rate_limit)
-        .build()
-        .run(block_range)
-        .await
+        .build();
+
+    let mut extra_blocks = args.blocks;
+    if args.historical {
+        extra_blocks.extend(historical_blocks(*block_range.end()));
+    }
+    extra_blocks.sort_unstable();
+    extra_blocks.dedup();
+    extra_blocks.retain(|block| !block_range.contains(block));
+
+    // Run both suites to completion before failing so a diff in one does not hide the other.
+    let range_result = tester.run(block_range).await;
+    if !extra_blocks.is_empty() {
+        info!(blocks = ?extra_blocks, "testing historical blocks");
+        tester.run_blocks(extra_blocks).await?;
+    }
+    range_result
 }
 
 /// Waits until rpc1 is synced to the tip and returns a valid block range to test against rpc2.
