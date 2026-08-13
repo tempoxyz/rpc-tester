@@ -69,7 +69,9 @@ async fn main() -> eyre::Result<()> {
         .network::<AnyNetwork>()
         .on_http(args.rpc2);
 
-    let block_range = wait_for_readiness(&rpc1, &rpc2, args.num_blocks).await?;
+    let block_range =
+        wait_for_readiness(&rpc1, &rpc2, args.num_blocks, Duration::from_secs(args.timeout))
+            .await?;
 
     let tester = RpcTester::builder(rpc1, rpc2)
         .with_tracing(args.use_tracing)
@@ -99,18 +101,14 @@ pub async fn wait_for_readiness<P: Provider<AnyNetwork>>(
     rpc1: &P,
     rpc2: &P,
     block_size_range: u64,
+    timeout: Duration,
 ) -> eyre::Result<RangeInclusive<u64>> {
-    let args = CliArgs::parse();
     let start_time = Instant::now();
-    let timeout = Duration::from_secs(args.timeout);
 
     // Waits until it's done syncing
     while let SyncStatus::Info(sync_info) = rpc1.syncing().await? {
         if start_time.elapsed() > timeout {
-            return Err(eyre::eyre!(
-                "Timeout waiting for rpc1 to sync after {} seconds",
-                args.timeout
-            ));
+            return Err(eyre::eyre!("Timeout waiting for rpc1 to sync after {timeout:?}"));
         }
         info!(?sync_info, "rpc1 still syncing");
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -123,7 +121,8 @@ pub async fn wait_for_readiness<P: Provider<AnyNetwork>>(
 
         if tip1 >= tip2 || tip2 - tip1 <= 5 {
             let common = tip1.min(tip2);
-            let range = common - (block_size_range - 1)..=common;
+            // Saturate so young chains with fewer blocks than the requested range still work.
+            let range = common.saturating_sub(block_size_range.saturating_sub(1))..=common;
             info!(?range, "testing block range");
             return Ok(range);
         }

@@ -113,6 +113,7 @@ alloy-primitives = "0.8.21"
 alloy-rpc-types = "0.11.1"
 alloy-rpc-types-trace = "0.11.1"
 alloy-provider = "0.11.1"
+alloy-node-bindings = "0.11.1"
 
 assert-json-diff = "2.0.2"
 clap = "4"
