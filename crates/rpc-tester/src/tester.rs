@@ -2,13 +2,13 @@
 
 use super::{MethodName, TestError};
 use crate::{get_logs, report::report, rpc, rpc_raw, rpc_with_block};
-use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, B256, U256};
 use alloy_provider::{
     ext::{DebugApi, TraceApi},
     network::{AnyNetwork, AnyRpcBlock, TransactionResponse},
     Provider,
 };
-use alloy_rpc_types::{BlockId, BlockNumberOrTag, Filter};
+use alloy_rpc_types::{AccessListResult, BlockId, BlockNumberOrTag, Filter};
 use alloy_rpc_types_trace::{
     filter::TraceFilter,
     geth::{GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions},
@@ -139,9 +139,24 @@ where
             tests.extend(block_calls);
 
             // // Transaction/Receipt based RPCs
-            for (index, (tx_hash, tx_from)) in
-                block.transactions.txns().map(|t| (t.tx_hash(), t.from)).enumerate()
-            {
+            for (index, tx) in block.transactions.txns().enumerate() {
+                let (tx_hash, tx_from) = (tx.tx_hash(), tx.from);
+
+                // Replaying the transaction as a call at the parent block exercises EVM execution
+                // on historical state, which no data-retrieval method touches. Both nodes get the
+                // identical request, so results (or revert errors) must agree.
+                let call_args =
+                    (call_request_json(tx), BlockId::number(block_number.saturating_sub(1)));
+                let estimate_args = call_args.clone();
+                let access_list_args = call_args.clone();
+                #[rustfmt::skip]
+                let exec_calls = vec![
+                    rpc_raw!(self, eth_call, Bytes, call_args),
+                    rpc_raw!(self, eth_estimateGas, U256, estimate_args),
+                    rpc_raw!(self, eth_createAccessList, AccessListResult, access_list_args),
+                ];
+                tests.extend(exec_calls);
+
                 if let Some(receipt) = self.rpc2.get_transaction_receipt(tx_hash).await? {
                     if let Some(log) = receipt.inner.inner.logs().first().map(|l| l.address()) {
                         #[rustfmt::skip]
@@ -384,6 +399,22 @@ where
 
         (name.to_string(), result)
     }
+}
+
+/// Builds an `eth_call` request object from a transaction response, keeping only the execution
+/// relevant fields.
+///
+/// Fee fields are omitted so the call is exempt from fee and balance validation, and a missing
+/// `to` naturally maps to a create call.
+fn call_request_json(tx: &impl Serialize) -> serde_json::Value {
+    let tx = serde_json::to_value(tx).expect("should json");
+    let mut request = serde_json::Map::new();
+    for key in ["from", "to", "gas", "value", "input"] {
+        if let Some(value) = tx.get(key).filter(|value| !value.is_null()) {
+            request.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(request)
 }
 
 /// Returns whether two RPC errors are the same error response.
