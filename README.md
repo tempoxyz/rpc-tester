@@ -18,7 +18,10 @@ Options:
   -h, --help                     Print help
 ```
 
-In addition to the `[head - num_blocks + 1, head]` tip range, every run samples log-spaced
-historical blocks backwards from the tip (`head-128`, `head-1024`, `head-10000`, `head-100000`,
-`head-1000000`, capped at genesis). These exercise cold history such as static files and pruned
-tables that near-tip blocks do not.
+In addition to the `[head - num_blocks + 1, head]` tip range, every run randomly samples
+historical blocks: `num_blocks` picks from the near-history window `[head-128, head-8]`, which
+crosses the boundary where lazily persisting clients move blocks from memory to storage, plus one
+pick per log-spaced deep-history stratum (offsets up to 1024, 10000, 100000 and 1000000, capped
+at genesis). Deep samples exercise cold history such as static files and pruned tables that
+near-tip blocks do not, and randomness means repeated runs accumulate coverage instead of
+re-testing the same blocks. The sampled set is logged at startup.

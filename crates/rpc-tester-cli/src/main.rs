@@ -79,9 +79,10 @@ async fn main() -> eyre::Result<()> {
         .with_rate_limit(args.rate_limit)
         .build();
 
-    // Log-spaced historical samples reaching beyond the tip range. These exercise cold history
-    // (static files, pruned tables) that near-tip blocks do not.
-    let mut historical = historical_blocks(*block_range.end());
+    // Random historical samples reaching beyond the tip range: near-history picks crossing the
+    // persistence boundary of lazily persisting clients, plus one pick per deep-history stratum
+    // exercising cold storage. Randomness accumulates coverage across repeated runs.
+    let mut historical = historical_blocks(*block_range.end(), args.num_blocks as usize);
     historical.retain(|block| !block_range.contains(block));
 
     // Run both suites to completion before failing so a diff in one does not hide the other.
