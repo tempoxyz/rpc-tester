@@ -116,7 +116,13 @@ where
                 rpc!(self, get_block_transaction_count_by_number, block_tag),
                 rpc!(self, get_uncle_count, BlockId::Hash(block_hash.into())),
                 rpc!(self, get_uncle_count, BlockId::Number(block_tag)),
+                rpc!(self, get_uncle, BlockId::Hash(block_hash.into()), 0u64),
+                rpc!(self, get_uncle, BlockId::Number(block_tag), 0u64),
                 rpc!(self, get_block_receipts, block_id),
+                // Raw-encoding parity catches divergence that JSON normalization hides.
+                rpc!(self, debug_get_raw_header, block_id),
+                rpc!(self, debug_get_raw_block, block_id),
+                rpc!(self, debug_get_raw_receipts, block_id),
                 rpc_raw!(self, reth_getBalanceChangesInBlock, BalanceChanges, (block_id,)),
                 rpc!(self, trace_block, block_id),
                 rpc!(self, trace_replay_block_transactions, block_id, &[TraceType::StateDiff][..]),
@@ -169,6 +175,7 @@ where
                 #[rustfmt::skip]
                 let tx_calls = vec![
                     rpc!(self, get_raw_transaction_by_hash, tx_hash),
+                    rpc!(self, debug_get_raw_transaction, tx_hash),
                     rpc!(self, get_transaction_by_hash, tx_hash),
                     rpc!(self, get_transaction_by_block_hash_and_index, block_hash, index),
                     rpc!(self, get_transaction_by_block_number_and_index, block_tag, index),
@@ -236,6 +243,9 @@ where
         report(vec![(
             format!("{start}..={end}"),
             futures::future::join_all([
+                rpc!(self, get_chain_id),
+                // Fully deterministic for a historical range anchored to a numeric block.
+                rpc!(self, get_fee_history, end - start + 1, BlockNumberOrTag::Number(end), &[25.0, 50.0, 75.0][..]),
                 get_logs!(self, Filter::new().from_block(start).to_block(end)),
                 get_logs!(self, Filter::new().from_block(start).to_block(end).address(vec![
                     "0x6b175474e89094c44da98b954eedeac495271d0f".parse::<Address>().unwrap(), // dai
