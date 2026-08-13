@@ -42,6 +42,16 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
                         println!("{diffs}");
                     }
                 }
+                Err(TestError::ErrDiff { rpc1, rpc2, args }) => {
+                    passed_title = false;
+                    println!("\n{title} ❌");
+                    println!("    {name}: ❌ Error mismatch");
+                    if let Some(args) = args {
+                        println!("      args: {args}");
+                    }
+                    println!("      rpc1: {rpc1}");
+                    println!("      rpc2: {rpc2}");
+                }
                 Err(TestError::Rpc1Err(err) | TestError::Rpc2Err(err)) => {
                     passed_title = false;
                     println!("\n{title} ❌");
