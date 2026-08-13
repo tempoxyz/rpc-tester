@@ -136,6 +136,15 @@ where
                     if let Some(log) = receipt.inner.inner.logs().first().map(|l| l.address()) {
                         #[rustfmt::skip]
                         tests.push(get_logs!(self, Filter::new().select(block_number).address(log)));
+
+                        // State of the contract that emitted the log at this block. These hit the
+                        // bytecode and (historical) storage paths, which no other call exercises.
+                        #[rustfmt::skip]
+                        let state_calls = vec![
+                            rpc_with_block!(self, get_code_at, log; block_id),
+                            rpc_with_block!(self, get_storage_at, log, U256::ZERO; block_id),
+                        ];
+                        tests.extend(state_calls);
                     }
 
                     if let Some(topic) = receipt
@@ -162,6 +171,9 @@ where
                     rpc!(self, get_transaction_receipt, tx_hash),
                     rpc_with_block!(self, get_transaction_count, tx_from; block_id),
                     rpc_with_block!(self, get_balance, tx_from; block_id),
+                    // Senders are usually EOAs, but EIP-7702 delegations make sender code
+                    // observable.
+                    rpc_with_block!(self, get_code_at, tx_from; block_id),
                     rpc!(self, debug_trace_transaction, tx_hash, tracer_opts),
                 ];
                 tests.extend(tx_calls);
