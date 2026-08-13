@@ -13,6 +13,7 @@ Options:
       --use-tracing              Whether to query tracing methods
       --use-all-txes             Whether to query every transacion from a block or just the first
       --skip-extended-eth        Skip extended eth methods not supported by all clients (e.g., `eth_getRawTransactionByBlockNumberAndIndex`)
+      --use-finality-tags        Whether to compare the moving `safe` and `finalized` tags
       --timeout <TIMEOUT>        Maximum time to wait for syncing in seconds [default: 300]
       --rate-limit <RATE_LIMIT>  Maximum requests per second (rate limit)
   -h, --help                     Print help

@@ -52,6 +52,12 @@ pub struct CliArgs {
     /// If not provided, no rate limiting is applied.
     #[arg(long, value_name = "RATE_LIMIT")]
     pub rate_limit: Option<u32>,
+
+    /// Whether to compare the moving `safe` and `finalized` tags.
+    ///
+    /// Requires both nodes to share a consensus view, otherwise the tags can legitimately differ.
+    #[arg(long)]
+    pub use_finality_tags: bool,
 }
 
 #[tokio::main]
@@ -78,6 +84,7 @@ async fn main() -> eyre::Result<()> {
         .with_reth(args.use_reth)
         .with_all_txes(args.use_all_txes)
         .skip_extended_eth(args.skip_extended_eth)
+        .with_finality_tags(args.use_finality_tags)
         .with_rate_limit(args.rate_limit)
         .build();
 
