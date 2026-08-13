@@ -4,6 +4,7 @@ use alloy_primitives::BlockNumber;
 use alloy_provider::{network::AnyNetwork, Provider};
 use alloy_rpc_types::{BlockNumberOrTag, Filter, Log};
 use futures::FutureExt;
+use tracing::warn;
 
 /// The result type returned by `get_logs`.
 pub type GetLogsResult<T> =
@@ -47,6 +48,14 @@ fn get_logs_paginated<'a, P: Provider<AnyNetwork>>(
                 let Some((suggested_from, suggested_to)) = parse_max_results_error(&e) else {
                     return Err(e);
                 };
+
+                // Surface pagination: if only one node paginates, the compared results are
+                // client-side concatenations rather than single server responses, which can mask
+                // server-side ordering or limit bugs.
+                warn!(
+                    ?filter,
+                    suggested_from, suggested_to, "eth_getLogs exceeded max results, paginating"
+                );
 
                 let Some(suggested_chunk) =
                     suggested_to.checked_sub(suggested_from).and_then(|d| d.checked_add(1))

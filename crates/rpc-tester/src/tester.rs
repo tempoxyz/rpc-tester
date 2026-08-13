@@ -130,6 +130,7 @@ where
                 rpc!(self, debug_trace_block_by_number, block_tag, call_tracer_opts()),
                 rpc!(self, debug_trace_block_by_number, block_tag, prestate_tracer_opts()),
                 get_logs!(self, &Filter::new().select(block_number)),
+                get_logs!(self, &Filter::new().at_block_hash(block_hash)),
                 get_logs!(self, &Filter::new().select(block_number).address(vec![
                     "0x6b175474e89094c44da98b954eedeac495271d0f".parse::<Address>().unwrap(), // dai
                     "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse::<Address>().unwrap(), // usdc
@@ -184,6 +185,36 @@ where
                         tests.push(
                             get_logs!(self, Filter::new().select(block_number).event_signature(topic))
                         );
+                    }
+
+                    // Multi-topic filter combining topic0 and topic1 of the same log, which
+                    // exercises positional topic matching instead of just the signature index.
+                    if let Some(log) =
+                        receipt.inner.inner.logs().iter().find(|log| log.topics().len() >= 2)
+                    {
+                        let (topic0, topic1) = (log.topics()[0], log.topics()[1]);
+                        #[rustfmt::skip]
+                        tests.push(get_logs!(
+                            self,
+                            Filter::new().select(block_number).event_signature(topic0).topic1(topic1)
+                        ));
+                    }
+
+                    // OR-list filter over multiple event signatures.
+                    let mut signatures: Vec<B256> = receipt
+                        .inner
+                        .inner
+                        .logs()
+                        .iter()
+                        .filter_map(|log| log.topics().first().copied())
+                        .collect();
+                    signatures.sort_unstable();
+                    signatures.dedup();
+                    signatures.truncate(4);
+                    if signatures.len() >= 2 {
+                        let or_filter =
+                            Filter::new().select(block_number).event_signature(signatures);
+                        tests.push(get_logs!(self, or_filter));
                     }
                 }
 
