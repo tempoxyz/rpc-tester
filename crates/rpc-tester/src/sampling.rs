@@ -3,7 +3,10 @@
 use alloy_primitives::BlockNumber;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Shallowest offset of the near-history window, exclusive of the tip range.
+/// Shallowest offset of the near-history window.
+///
+/// Matches the default tip-range size so default runs do not overlap; callers testing a larger
+/// tip range must filter overlapping samples themselves.
 pub const NEAR_WINDOW_MIN_OFFSET: u64 = 8;
 
 /// Deepest offset of the near-history window.
@@ -15,18 +18,22 @@ pub const NEAR_WINDOW_MAX_OFFSET: u64 = 128;
 
 /// Deep-history offset strata. One block is sampled uniformly from each `(start, end]` offset
 /// range, keeping depth coverage log-spread without fixed blind spots between samples.
+///
+/// Ordered from shallowest to deepest; [`historical_blocks`] relies on this to stop at the first
+/// stratum entirely beyond `head`.
 pub const DEEP_STRATA: [(u64, u64); 4] =
     [(128, 1_024), (1_024, 10_000), (10_000, 100_000), (100_000, 1_000_000)];
 
 /// Returns randomly sampled historical block numbers below `head`.
 ///
 /// Samples `near_samples` blocks uniformly from the near-history window (see
-/// [`NEAR_WINDOW_MAX_OFFSET`]) plus one block per [`DEEP_STRATA`] stratum, skipping any range
-/// that reaches past genesis. The result is sorted ascending and deduplicated, so it may contain
-/// fewer entries than requested. Randomness means repeated runs accumulate coverage instead of
-/// re-testing the same blocks; the caller should log the sampled set.
+/// [`NEAR_WINDOW_MAX_OFFSET`]) plus one block per [`DEEP_STRATA`] stratum, clamping a partially
+/// reachable range to genesis and skipping ranges entirely beyond `head`. The result is sorted
+/// ascending and deduplicated, so it may contain fewer entries than requested. Randomness means
+/// repeated runs accumulate coverage instead of re-testing the same blocks; the caller should log
+/// the sampled set.
 pub fn historical_blocks(head: BlockNumber, near_samples: usize) -> Vec<BlockNumber> {
-    sample_blocks(head, near_samples, &mut Rng::from_entropy())
+    sample_blocks(head, near_samples, &mut Rng::from_clock())
 }
 
 /// Deterministic core of [`historical_blocks`].
@@ -61,7 +68,7 @@ struct Rng(u64);
 
 impl Rng {
     /// Seeds the generator from the system clock.
-    fn from_entropy() -> Self {
+    fn from_clock() -> Self {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         // Never zero, which would make xorshift degenerate.

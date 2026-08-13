@@ -71,36 +71,50 @@ where
     P: Provider<AnyNetwork> + Clone + Send + Sync,
 {
     /// Verifies that results from `rpc1` are at least a superset of `rpc2`.
+    ///
+    /// All suites run to completion before failing so a diff in one does not hide findings in
+    /// another; the first error is returned after every report has been printed.
     pub async fn run(&self, block_range: RangeInclusive<BlockNumber>) -> Result<()> {
-        self.test_per_block(block_range.clone()).await?;
-        self.test_block_range(block_range.clone()).await?;
-        self.test_negative(*block_range.end()).await?;
-        self.test_tags().await?;
-        Ok(())
+        let per_block = self.test_per_block(block_range.clone()).await;
+        let block_range_result = self.test_block_range(block_range.clone()).await;
+        let negative = self.test_negative(*block_range.end()).await;
+        let tags = self.test_tags().await;
+        per_block.and(block_range_result).and(negative).and(tags)
     }
 
     /// Verifies RPC calls applicable to single blocks for each of the given blocks.
     ///
-    /// Unlike [`Self::run`], this does not run block range tests, so the blocks do not need to be
-    /// contiguous. This is intended for sampled historical blocks, see
-    /// [`historical_blocks`](crate::historical_blocks).
+    /// Unlike [`Self::run`], this runs only the per-block suite — no block-range, negative-probe,
+    /// or block-tag tests — so the blocks do not need to be contiguous. This is intended for
+    /// sampled historical blocks, see [`historical_blocks`](crate::historical_blocks).
     pub async fn run_blocks(&self, blocks: impl IntoIterator<Item = BlockNumber>) -> Result<()> {
         self.test_per_block(blocks).await
     }
 
     /// Verifies RPC calls applicable to single blocks.
+    ///
+    /// If a block cannot be fetched, the results collected so far are still reported before the
+    /// fetch error is returned.
     async fn test_per_block(
         &self,
         blocks: impl IntoIterator<Item = BlockNumber>,
     ) -> Result<(), eyre::Error> {
         let mut results = BlockTestResults::new();
+        let mut fetch_err = None;
 
         for block_number in blocks {
             info!(block_number, "testing rpc");
 
             let mut tests = vec![];
 
-            let (block, block_hash, block_tag, block_id) = self.fetch_block(block_number).await?;
+            let (block, block_hash, block_tag, block_id) =
+                match self.fetch_block(block_number).await {
+                    Ok(fetched) => fetched,
+                    Err(err) => {
+                        fetch_err = Some(err);
+                        break;
+                    }
+                };
 
             // EIP-1898 block hash object form with require canonical semantics.
             let canonical_args = (
@@ -171,7 +185,9 @@ where
 
                 // Replaying the transaction as a call at the parent block exercises EVM execution
                 // on historical state, which no data-retrieval method touches. Both nodes get the
-                // identical request, so results (or revert errors) must agree.
+                // identical request, so results (or revert errors) must agree. Note that gas
+                // estimates and access lists are implementation-defined, so those two comparisons
+                // are meaningful primarily for same-client pairs.
                 let call_args =
                     (call_request_json(&tx_json), BlockId::number(block_number.saturating_sub(1)));
                 let estimate_args = call_args.clone();
@@ -275,7 +291,12 @@ where
             let block_results = futures::future::join_all(tests).await;
             results.insert(block_number, block_results);
         }
-        report(results.into_iter().map(|(k, v)| (format!("Block Number {k}"), v)).collect())
+        let report_result =
+            report(results.into_iter().map(|(k, v)| (format!("Block Number {k}"), v)).collect());
+        if let Some(err) = fetch_err {
+            return Err(err);
+        }
+        report_result
     }
 
     /// Verifies RPC calls applicable to block ranges.
@@ -379,7 +400,12 @@ where
         report(vec![("Block tags".to_string(), futures::future::join_all(tests).await)])
     }
 
-    /// Fetches block and block identifiers from `self.truth`.
+    /// Fetches the block and its identifiers from `rpc2`, verifying both nodes agree on the
+    /// canonical hash.
+    ///
+    /// Retries briefly to ride out transient tip reorgs (this narrows the reorg window, it does
+    /// not close it) and errors on persistent divergence or when either node is missing the
+    /// block.
     async fn fetch_block(
         &self,
         block_number: u64,
@@ -421,15 +447,22 @@ where
             last_hashes = (rpc1_hash, Some(block_hash));
         }
 
-        Err(eyre::eyre!(
-            "rpc1 and rpc2 disagree on the canonical hash of block {block_number}: rpc1 {:?} vs rpc2 {:?}",
-            last_hashes.0,
-            last_hashes.1
-        ))
+        // A missing block on rpc1 is a coverage gap (pruned or unsynced history), not a reorg;
+        // report it as such instead of a hash disagreement.
+        match last_hashes {
+            (None, _) => Err(eyre::eyre!("block {block_number} not found on rpc1")),
+            (Some(rpc1_hash), rpc2_hash) => Err(eyre::eyre!(
+                "rpc1 and rpc2 disagree on the canonical hash of block {block_number}: rpc1 {rpc1_hash} vs rpc2 {rpc2_hash:?}",
+            )),
+        }
     }
 
     /// Apply rate limiting if configured.
     /// Sleeps if necessary to maintain the configured rate limit.
+    ///
+    /// The limit is applied per test, and each test issues one request per node, so an endpoint
+    /// serving both roles receives up to twice the configured rate. `eth_getLogs` pagination
+    /// retries and block/receipt prefetches are not throttled.
     async fn apply_rate_limit(&self) {
         if let Some(rps) = self.rate_limit_rps {
             let min_interval = std::time::Duration::from_secs_f64(1.0 / rps as f64);
@@ -459,7 +492,11 @@ where
         Fut: std::future::Future<Output = Result<T, TransportError>> + 'a + Send,
         T: PartialEq + Debug + Serialize,
     {
-        if name.starts_with("reth") && !self.use_reth || name.contains("trace") && !self.use_tracing
+        // The debug namespace is gated together with tracing: `debug_getRaw*` are typically
+        // enabled alongside the trace methods, and running them against nodes without the
+        // namespace would fail every block.
+        if name.starts_with("reth") && !self.use_reth ||
+            (name.contains("trace") || name.starts_with("debug")) && !self.use_tracing
         {
             return (name.to_string(), Ok(()));
         }
@@ -486,9 +523,12 @@ where
                 }
             }
             // Both nodes rejecting the call with the same error response is agreement, e.g. a
-            // deliberate miss-path probe or a namespace disabled on both nodes.
+            // deliberate miss-path probe or a namespace disabled on both nodes. Warn on each
+            // such pass: a run where entire suites "agree on errors" compares no data and would
+            // otherwise be indistinguishable from a verified run.
             (Err(e1), Err(e2)) => {
                 if errors_match(&e1, &e2) {
+                    warn!(name, error = ?e1, "passed via matching errors, no data compared");
                     Ok(())
                 } else {
                     Err(TestError::ErrDiff {
@@ -506,10 +546,13 @@ where
     }
 }
 
-/// Builds an `eth_call` request object from a transaction response's JSON, keeping only the
-/// execution relevant fields.
+/// Builds an `eth_call` request object from a transaction response's JSON, keeping a minimal
+/// subset of fields (`from`, `to`, `gas`, `value`, `input`).
 ///
-/// Fee fields are omitted so the call is exempt from fee and balance validation, and a missing
+/// Access and authorization lists are dropped, so the call is not a faithful replay — but both
+/// nodes receive the identical request, so parity still holds. The gas price is pinned to zero
+/// rather than omitted: the effective price of a fee-less call is client-defined, and a contract
+/// branching on `GASPRICE` would otherwise legitimately diverge across implementations. A missing
 /// `to` naturally maps to a create call.
 fn call_request_json(tx: &serde_json::Value) -> serde_json::Value {
     let mut request = serde_json::Map::new();
@@ -518,6 +561,7 @@ fn call_request_json(tx: &serde_json::Value) -> serde_json::Value {
             request.insert(key.to_string(), value.clone());
         }
     }
+    request.insert("gasPrice".to_string(), serde_json::Value::String("0x0".to_string()));
     serde_json::Value::Object(request)
 }
 
@@ -527,7 +571,14 @@ fn call_request_json(tx: &serde_json::Value) -> serde_json::Value {
 /// such as timeouts are never treated as agreement.
 fn errors_match(e1: &TransportError, e2: &TransportError) -> bool {
     match (e1.as_error_resp(), e2.as_error_resp()) {
-        (Some(r1), Some(r2)) => r1.code == r2.code && r1.message == r2.message,
+        // The data field must match too: reverts surface as identical code/message pairs with
+        // the revert bytes in data, and differing revert data is genuine execution divergence.
+        (Some(r1), Some(r2)) => {
+            r1.code == r2.code &&
+                r1.message == r2.message &&
+                r1.data.as_ref().map(|data| data.get()) ==
+                    r2.data.as_ref().map(|data| data.get())
+        }
         _ => false,
     }
 }
@@ -653,6 +704,14 @@ mod tests {
         })
     }
 
+    fn error_resp_with_data(code: i64, message: &str, data: &str) -> TransportError {
+        TransportError::ErrorResp(ErrorPayload {
+            code,
+            message: message.to_string().into(),
+            data: Some(serde_json::value::RawValue::from_string(data.to_string()).unwrap()),
+        })
+    }
+
     #[test]
     fn matching_error_responses_agree() {
         assert!(errors_match(
@@ -668,6 +727,23 @@ mod tests {
             &error_resp(-32601, "transaction not found")
         ));
         assert!(!errors_match(&error_resp(-32000, "a"), &error_resp(-32000, "b")));
+    }
+
+    #[test]
+    fn different_revert_data_diverges() {
+        // Reverts share code 3 and a generic message; the revert bytes live in data.
+        assert!(!errors_match(
+            &error_resp_with_data(3, "execution reverted", "\"0xdead\""),
+            &error_resp_with_data(3, "execution reverted", "\"0xbeef\"")
+        ));
+        assert!(!errors_match(
+            &error_resp_with_data(3, "execution reverted", "\"0xdead\""),
+            &error_resp(3, "execution reverted")
+        ));
+        assert!(errors_match(
+            &error_resp_with_data(3, "execution reverted", "\"0xdead\""),
+            &error_resp_with_data(3, "execution reverted", "\"0xdead\"")
+        ));
     }
 
     #[test]

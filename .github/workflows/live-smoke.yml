@@ -1,7 +1,9 @@
 name: live-smoke
 
 # Smoke test against a live endpoint used as both rpc1 and rpc2: comparing a node against itself
-# must always succeed, so a failure indicates a bug in the tester (or an endpoint outage).
+# should succeed, so a failure usually indicates a bug in the tester or an endpoint outage. Note
+# that a load-balanced endpoint can route the two clients to backends at slightly different
+# heights, so near-tip flakes are possible; persistent failures are the signal.
 
 on:
   workflow_dispatch:
@@ -36,4 +38,4 @@ jobs:
           --rpc1 "$RPC"
           --rpc2 "$RPC"
           --num-blocks 3
-          --rate-limit 20
+          --rate-limit 10

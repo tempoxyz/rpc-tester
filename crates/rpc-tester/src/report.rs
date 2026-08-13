@@ -43,8 +43,10 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
                     }
                 }
                 Err(TestError::ErrDiff { rpc1, rpc2, args }) => {
-                    passed_title = false;
-                    println!("\n{title} ❌");
+                    if passed_title {
+                        passed_title = false;
+                        println!("\n{title} ❌");
+                    }
                     println!("    {name}: ❌ Error mismatch");
                     if let Some(args) = args {
                         println!("      args: {args}");
@@ -53,8 +55,10 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
                     println!("      rpc2: {rpc2}");
                 }
                 Err(TestError::Rpc1Err(err) | TestError::Rpc2Err(err)) => {
-                    passed_title = false;
-                    println!("\n{title} ❌");
+                    if passed_title {
+                        passed_title = false;
+                        println!("\n{title} ❌");
+                    }
                     println!("    {name}: ❌ {err}");
                 }
             }
@@ -90,6 +94,10 @@ fn filter_ignored_fields(value: Value) -> Value {
 }
 
 /// Verifies if there is any missing field/element from rpc1 comparing it to rpc2.
+///
+/// Note that the superset semantics of `assert_json_include` only apply to object keys. Arrays
+/// are compared positionally: extra trailing elements in rpc1 are tolerated, but an extra element
+/// anywhere else shifts subsequent indices and fails.
 fn verify_missing_or_mismatch(rpc1: Value, rpc2: Value) -> Option<String> {
     let default_panic_hook = std::panic::take_hook();
 
@@ -113,4 +121,54 @@ fn verify_missing_or_mismatch(rpc1: Value, rpc2: Value) -> Option<String> {
         return Some(err_msg);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // A single test so the panic-hook manipulation in `verify_missing_or_mismatch` is never
+    // raced by a parallel test.
+    #[test]
+    fn report_detects_diffs() {
+        // rpc1 being a strict superset of rpc2 passes.
+        let superset = TestError::Diff {
+            rpc1: json!({ "a": 1, "extra": 2 }),
+            rpc2: json!({ "a": 1 }),
+            args: None,
+        };
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(superset))])]).is_ok());
+
+        // rpc1 missing a field that rpc2 has fails.
+        let missing = TestError::Diff {
+            rpc1: json!({ "a": 1 }),
+            rpc2: json!({ "a": 1, "b": 2 }),
+            args: None,
+        };
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(missing))])]).is_err());
+
+        // A mismatching field value fails.
+        let mismatch =
+            TestError::Diff { rpc1: json!({ "a": 1 }), rpc2: json!({ "a": 2 }), args: None };
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(mismatch))])]).is_err());
+
+        // Ignored client-specific extension fields do not fail.
+        let ignored = TestError::Diff {
+            rpc1: json!({ "a": 1 }),
+            rpc2: json!({ "a": 1, "error": "reverted" }),
+            args: None,
+        };
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(ignored))])]).is_ok());
+
+        // Error mismatches and node errors always fail.
+        let err_diff =
+            TestError::ErrDiff { rpc1: "a".to_string(), rpc2: "b".to_string(), args: None };
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(err_diff))])]).is_err());
+        let rpc1_err = TestError::Rpc1Err("boom".to_string());
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(rpc1_err))])]).is_err());
+
+        // Passing results pass.
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Ok(()))])]).is_ok());
+    }
 }
