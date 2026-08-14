@@ -51,6 +51,12 @@ pub struct CliArgs {
     #[arg(long)]
     pub use_finality_tags: bool,
 
+    /// Whether to compare `debug_executionWitness` for the newest tested block.
+    ///
+    /// Witness generation re-executes the block and is expensive, so this is opt-in.
+    #[arg(long)]
+    pub use_execution_witness: bool,
+
     /// Maximum time to wait for syncing in seconds
     #[arg(long, value_name = "TIMEOUT", default_value = "300")]
     pub timeout: u64,
@@ -86,6 +92,7 @@ async fn main() -> eyre::Result<()> {
         .with_all_txes(args.use_all_txes)
         .skip_extended_eth(args.skip_extended_eth)
         .with_finality_tags(args.use_finality_tags)
+        .with_execution_witness(args.use_execution_witness)
         .with_rate_limit(args.rate_limit)
         .build();
 

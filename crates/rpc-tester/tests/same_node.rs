@@ -66,6 +66,7 @@ async fn same_node_passes() {
         .with_tracing(true)
         .with_all_txes(true)
         .with_finality_tags(true)
+        .with_execution_witness(true)
         .build();
 
     // Full suite over the whole chain, including the empty genesis block.
