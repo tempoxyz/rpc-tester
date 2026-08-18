@@ -3,7 +3,7 @@
 use alloy_provider::{network::AnyNetwork, Provider, ProviderBuilder};
 use alloy_rpc_types::SyncStatus;
 use clap::Parser;
-use rpc_tester::RpcTester;
+use rpc_tester::{historical_blocks, RpcTester};
 use std::{
     ops::RangeInclusive,
     time::{Duration, Instant},
@@ -24,7 +24,7 @@ pub struct CliArgs {
     pub rpc2: Url,
 
     /// Number of blocks to test from the tip.
-    #[arg(long, value_name = "NUM_BLOCKS", default_value = "32")]
+    #[arg(long, value_name = "NUM_BLOCKS", default_value = "8")]
     pub num_blocks: u64,
 
     /// Whether to query reth namespace
@@ -71,15 +71,27 @@ async fn main() -> eyre::Result<()> {
 
     let block_range = wait_for_readiness(&rpc1, &rpc2, args.num_blocks).await?;
 
-    RpcTester::builder(rpc1, rpc2)
+    let tester = RpcTester::builder(rpc1, rpc2)
         .with_tracing(args.use_tracing)
         .with_reth(args.use_reth)
         .with_all_txes(args.use_all_txes)
         .skip_extended_eth(args.skip_extended_eth)
         .with_rate_limit(args.rate_limit)
-        .build()
-        .run(block_range)
-        .await
+        .build();
+
+    // Random historical samples reaching beyond the tip range: near-history picks crossing the
+    // persistence boundary of lazily persisting clients, plus one pick per deep-history stratum
+    // exercising cold storage. Randomness accumulates coverage across repeated runs.
+    let mut historical = historical_blocks(*block_range.end(), args.num_blocks as usize);
+    historical.retain(|block| !block_range.contains(block));
+
+    // Run both suites to completion before failing so a diff in one does not hide the other.
+    let range_result = tester.run(block_range).await;
+    if !historical.is_empty() {
+        info!(blocks = ?historical, "testing historical blocks");
+        tester.run_blocks(historical).await?;
+    }
+    range_result
 }
 
 /// Waits until rpc1 is synced to the tip and returns a valid block range to test against rpc2.

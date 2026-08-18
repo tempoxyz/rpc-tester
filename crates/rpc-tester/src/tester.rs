@@ -71,11 +71,23 @@ where
         Ok(())
     }
 
+    /// Verifies RPC calls applicable to single blocks for each of the given blocks.
+    ///
+    /// Unlike [`Self::run`], this does not run block range tests, so the blocks do not need to be
+    /// contiguous. This is intended for sampled historical blocks, see
+    /// [`historical_blocks`](crate::historical_blocks).
+    pub async fn run_blocks(&self, blocks: impl IntoIterator<Item = BlockNumber>) -> Result<()> {
+        self.test_per_block(blocks).await
+    }
+
     /// Verifies RPC calls applicable to single blocks.
-    async fn test_per_block(&self, block_range: RangeInclusive<u64>) -> Result<(), eyre::Error> {
+    async fn test_per_block(
+        &self,
+        blocks: impl IntoIterator<Item = BlockNumber>,
+    ) -> Result<(), eyre::Error> {
         let mut results = BlockTestResults::new();
 
-        for block_number in block_range {
+        for block_number in blocks {
             info!(block_number, "testing rpc");
 
             let mut tests = vec![];
@@ -210,8 +222,12 @@ where
             .rpc2
             .get_block_by_number(block_number.into(), true.into())
             .await?
-            .expect("should have block from range");
-        assert_eq!(block.header.number, block_number);
+            .ok_or_else(|| eyre::eyre!("block {block_number} not found on rpc2"))?;
+        eyre::ensure!(
+            block.header.number == block_number,
+            "rpc2 returned block {} for requested block {block_number}",
+            block.header.number
+        );
         let block_hash = block.header.hash;
         let block_tag = BlockNumberOrTag::Number(block_number);
         let block_id = BlockId::Number(block_tag);

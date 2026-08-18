@@ -6,6 +6,10 @@ pub mod get_logs;
 mod tester;
 pub use tester::RpcTester;
 mod report;
+mod sampling;
+pub use sampling::{
+    historical_blocks, DEEP_STRATA, NEAR_WINDOW_MAX_OFFSET, NEAR_WINDOW_MIN_OFFSET,
+};
 
 /// Equality rpc test error
 enum TestError {
