@@ -14,6 +14,7 @@ use alloy_rpc_types_trace::{
     geth::{GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions},
     parity::TraceType,
 };
+use alloy_transport::TransportError;
 use eyre::Result;
 use futures::Future;
 use serde::Serialize;
@@ -69,7 +70,8 @@ where
     /// Verifies that results from `rpc1` are at least a superset of `rpc2`.
     pub async fn run(&self, block_range: RangeInclusive<BlockNumber>) -> Result<()> {
         self.test_per_block(block_range.clone()).await?;
-        self.test_block_range(block_range).await?;
+        self.test_block_range(block_range.clone()).await?;
+        self.test_negative(*block_range.end()).await?;
         Ok(())
     }
 
@@ -248,6 +250,33 @@ where
         Ok(())
     }
 
+    /// Verifies that both nodes agree on requests for data that does not exist.
+    ///
+    /// Clients diverge a lot on the miss path: null vs error responses, and error codes for
+    /// invalid requests. All probes use inputs that cannot exist, so both nodes must return the
+    /// same null response or the same error.
+    async fn test_negative(&self, head: BlockNumber) -> Result<(), eyre::Error> {
+        let missing_hash = B256::repeat_byte(0xff);
+        let future_tag = BlockNumberOrTag::Number(head.saturating_add(1_000_000));
+        let head_tag = BlockNumberOrTag::Number(head);
+
+        #[rustfmt::skip]
+        let tests = vec![
+            rpc!(self, get_block_by_hash, missing_hash, alloy_rpc_types::BlockTransactionsKind::Full),
+            rpc!(self, get_block_by_number, future_tag, alloy_rpc_types::BlockTransactionsKind::Full),
+            rpc!(self, get_block_transaction_count_by_number, future_tag),
+            rpc!(self, get_block_receipts, BlockId::Number(future_tag)),
+            rpc!(self, get_transaction_by_hash, missing_hash),
+            rpc!(self, get_raw_transaction_by_hash, missing_hash),
+            rpc!(self, get_transaction_receipt, missing_hash),
+            rpc!(self, get_transaction_by_block_number_and_index, head_tag, 100_000usize),
+            rpc!(self, trace_transaction, missing_hash),
+            rpc!(self, debug_trace_transaction, missing_hash, call_tracer_opts()),
+        ];
+
+        report(vec![("Negative probes".to_string(), futures::future::join_all(tests).await)])
+    }
+
     /// Fetches block and block identifiers from `self.truth`.
     async fn fetch_block(
         &self,
@@ -289,7 +318,7 @@ where
     /// Compares the response to a specific method between both rpcs. Only collects differences.
     ///
     /// If any namespace is disabled skip it.
-    async fn test_rpc_call<'a, F, Fut, T, E>(
+    async fn test_rpc_call<'a, F, Fut, T>(
         &'a self,
         name: &str,
         args: Option<String>,
@@ -297,9 +326,8 @@ where
     ) -> (MethodName, Result<(), TestError>)
     where
         F: Fn(&'a P) -> Fut + 'a,
-        Fut: std::future::Future<Output = Result<T, E>> + 'a + Send,
+        Fut: std::future::Future<Output = Result<T, TransportError>> + 'a + Send,
         T: PartialEq + Debug + Serialize,
-        E: Debug,
     {
         if name.starts_with("reth") && !self.use_reth || name.contains("trace") && !self.use_tracing
         {
@@ -327,11 +355,35 @@ where
                     })
                 }
             }
+            // Both nodes rejecting the call with the same error response is agreement, e.g. a
+            // deliberate miss-path probe or a namespace disabled on both nodes.
+            (Err(e1), Err(e2)) => {
+                if errors_match(&e1, &e2) {
+                    Ok(())
+                } else {
+                    Err(TestError::ErrDiff {
+                        rpc1: format!("{e1:?}"),
+                        rpc2: format!("{e2:?}"),
+                        args,
+                    })
+                }
+            }
             (Err(e), _) => Err(TestError::Rpc1Err(format!("rpc1: {e:?}"))),
             (Ok(_), Err(e)) => Err(TestError::Rpc2Err(format!("rpc2: {e:?}"))),
         };
 
         (name.to_string(), result)
+    }
+}
+
+/// Returns whether two RPC errors are the same error response.
+///
+/// Only JSON-RPC error responses are compared (by code and message); transport-level failures
+/// such as timeouts are never treated as agreement.
+fn errors_match(e1: &TransportError, e2: &TransportError) -> bool {
+    match (e1.as_error_resp(), e2.as_error_resp()) {
+        (Some(r1), Some(r2)) => r1.code == r2.code && r1.message == r2.message,
+        _ => false,
     }
 }
 
@@ -428,5 +480,46 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_json_rpc::ErrorPayload;
+    use alloy_transport::TransportErrorKind;
+
+    fn error_resp(code: i64, message: &str) -> TransportError {
+        TransportError::ErrorResp(ErrorPayload {
+            code,
+            message: message.to_string().into(),
+            data: None,
+        })
+    }
+
+    #[test]
+    fn matching_error_responses_agree() {
+        assert!(errors_match(
+            &error_resp(-32000, "transaction not found"),
+            &error_resp(-32000, "transaction not found")
+        ));
+    }
+
+    #[test]
+    fn different_error_responses_diverge() {
+        assert!(!errors_match(
+            &error_resp(-32000, "transaction not found"),
+            &error_resp(-32601, "transaction not found")
+        ));
+        assert!(!errors_match(&error_resp(-32000, "a"), &error_resp(-32000, "b")));
+    }
+
+    #[test]
+    fn transport_errors_never_agree() {
+        assert!(!errors_match(
+            &TransportErrorKind::backend_gone(),
+            &TransportErrorKind::backend_gone()
+        ));
+        assert!(!errors_match(&TransportErrorKind::backend_gone(), &error_resp(-32000, "a")));
     }
 }
