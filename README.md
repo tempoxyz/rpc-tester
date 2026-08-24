@@ -11,7 +11,7 @@ Options:
       --num-blocks <NUM_BLOCKS>  Number of blocks to test from the tip [default: 8]
       --use-reth                 Whether to query reth namespace
       --use-tracing              Whether to query tracing methods
-      --use-all-txes             Whether to query every transacion from a block or just the first
+      --use-all-txes             Whether to query every transaction from a block. Otherwise, the first transaction of each distinct type is sampled
       --skip-extended-eth        Skip extended eth methods not supported by all clients (e.g., `eth_getRawTransactionByBlockNumberAndIndex`)
       --use-finality-tags        Whether to compare the moving `safe` and `finalized` tags
       --timeout <TIMEOUT>        Maximum time to wait for syncing in seconds [default: 300]

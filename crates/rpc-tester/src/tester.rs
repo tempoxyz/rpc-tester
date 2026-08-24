@@ -25,7 +25,7 @@ use std::{
     ops::RangeInclusive,
     pin::Pin,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 // Alias type
 type BlockTestResults = BTreeMap<BlockNumber, Vec<(MethodName, Result<(), TestError>)>>;
@@ -44,8 +44,8 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     use_tracing: bool,
     /// Whether to query reth namespace.
     use_reth: bool,
-    /// Whether to call rpc transaction methods for every transaction. Otherwise, just the first of
-    /// the block.
+    /// Whether to call rpc transaction methods for every transaction. Otherwise, the first
+    /// transaction of each distinct type in the block.
     use_all_txes: bool,
     /// Whether to skip extended eth methods not supported by all clients (e.g.,
     /// `eth_getRawTransactionByBlockNumberAndIndex`).
@@ -151,14 +151,29 @@ where
             tests.extend(block_calls);
 
             // // Transaction/Receipt based RPCs
+            let mut seen_tx_types = Vec::new();
             for (index, tx) in block.transactions.txns().enumerate() {
+                let tx_json = serde_json::to_value(tx).expect("should json");
+
+                // Without --use-all-txes, sample the first transaction of each distinct type
+                // instead of just the first of the block: the first transaction is often the same
+                // kind of searcher activity, while rarer types (blob, 7702, legacy) exercise
+                // different serialization and execution paths.
+                if !self.use_all_txes {
+                    let tx_type = tx_json.get("type").cloned();
+                    if seen_tx_types.contains(&tx_type) {
+                        continue;
+                    }
+                    seen_tx_types.push(tx_type);
+                }
+
                 let (tx_hash, tx_from) = (tx.tx_hash(), tx.from);
 
                 // Replaying the transaction as a call at the parent block exercises EVM execution
                 // on historical state, which no data-retrieval method touches. Both nodes get the
                 // identical request, so results (or revert errors) must agree.
                 let call_args =
-                    (call_request_json(tx), BlockId::number(block_number.saturating_sub(1)));
+                    (call_request_json(&tx_json), BlockId::number(block_number.saturating_sub(1)));
                 let estimate_args = call_args.clone();
                 let access_list_args = call_args.clone();
                 #[rustfmt::skip]
@@ -255,10 +270,6 @@ where
                         rpc!(self, get_raw_transaction_by_block_number_and_index, block_tag, index),
                     ];
                     tests.extend(extended_calls);
-                }
-
-                if !self.use_all_txes {
-                    break;
                 }
             }
             let block_results = futures::future::join_all(tests).await;
@@ -373,20 +384,48 @@ where
         &self,
         block_number: u64,
     ) -> Result<(AnyRpcBlock, BlockHash, BlockNumberOrTag, BlockId), eyre::Error> {
-        let block = self
-            .rpc2
-            .get_block_by_number(block_number.into(), true.into())
-            .await?
-            .ok_or_else(|| eyre::eyre!("block {block_number} not found on rpc2"))?;
-        eyre::ensure!(
-            block.header.number == block_number,
-            "rpc2 returned block {} for requested block {block_number}",
-            block.header.number
-        );
-        let block_hash = block.header.hash;
         let block_tag = BlockNumberOrTag::Number(block_number);
         let block_id = BlockId::Number(block_tag);
-        Ok((block, block_hash, block_tag, block_id))
+
+        // Reorg guard: when the nodes disagree on the canonical hash mid-run, every downstream
+        // comparison diffs confusingly. Transient reorgs at the tip settle quickly, so retry a
+        // few times and fail with a clear error only on persistent divergence.
+        let mut last_hashes = (None, None);
+        for attempt in 0..4 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+
+            let block = self
+                .rpc2
+                .get_block_by_number(block_number.into(), true.into())
+                .await?
+                .ok_or_else(|| eyre::eyre!("block {block_number} not found on rpc2"))?;
+            eyre::ensure!(
+                block.header.number == block_number,
+                "rpc2 returned block {} for requested block {block_number}",
+                block.header.number
+            );
+            let block_hash = block.header.hash;
+
+            let rpc1_hash = self
+                .rpc1
+                .get_block_by_number(block_number.into(), false.into())
+                .await?
+                .map(|block| block.header.hash);
+            if rpc1_hash == Some(block_hash) {
+                return Ok((block, block_hash, block_tag, block_id));
+            }
+
+            warn!(block_number, ?rpc1_hash, rpc2_hash = %block_hash, "nodes disagree on canonical block hash, retrying");
+            last_hashes = (rpc1_hash, Some(block_hash));
+        }
+
+        Err(eyre::eyre!(
+            "rpc1 and rpc2 disagree on the canonical hash of block {block_number}: rpc1 {:?} vs rpc2 {:?}",
+            last_hashes.0,
+            last_hashes.1
+        ))
     }
 
     /// Apply rate limiting if configured.
@@ -467,13 +506,12 @@ where
     }
 }
 
-/// Builds an `eth_call` request object from a transaction response, keeping only the execution
-/// relevant fields.
+/// Builds an `eth_call` request object from a transaction response's JSON, keeping only the
+/// execution relevant fields.
 ///
 /// Fee fields are omitted so the call is exempt from fee and balance validation, and a missing
 /// `to` naturally maps to a create call.
-fn call_request_json(tx: &impl Serialize) -> serde_json::Value {
-    let tx = serde_json::to_value(tx).expect("should json");
+fn call_request_json(tx: &serde_json::Value) -> serde_json::Value {
     let mut request = serde_json::Map::new();
     for key in ["from", "to", "gas", "value", "input"] {
         if let Some(value) = tx.get(key).filter(|value| !value.is_null()) {
@@ -519,8 +557,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_tracing: bool,
     /// Whether to query reth namespace.
     use_reth: bool,
-    /// Whether to call rpc transaction methods for every transaction. Otherwise, just the first of
-    /// the block.
+    /// Whether to call rpc transaction methods for every transaction. Otherwise, the first
+    /// transaction of each distinct type in the block.
     use_all_txes: bool,
     /// Whether to skip extended eth methods not supported by all clients.
     skip_extended_eth: bool,
@@ -557,8 +595,8 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
-    /// Enables or disables querying all transactions. Will only query the first of the block if
-    /// disabled.
+    /// Enables or disables querying all transactions. Will only query the first transaction of
+    /// each distinct type in the block if disabled.
     pub const fn with_all_txes(mut self, is_enabled: bool) -> Self {
         self.use_all_txes = is_enabled;
         self

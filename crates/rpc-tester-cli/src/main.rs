@@ -35,7 +35,8 @@ pub struct CliArgs {
     #[arg(long, value_name = "TRACING", default_value = "false")]
     pub use_tracing: bool,
 
-    /// Whether to query every transacion from a block or just the first.
+    /// Whether to query every transaction from a block. Otherwise, the first transaction of each
+    /// distinct type is sampled.
     #[arg(long, value_name = "ALL_TXES", default_value = "false")]
     pub use_all_txes: bool,
 
