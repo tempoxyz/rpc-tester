@@ -9,8 +9,10 @@ use alloy_provider::{
     Provider,
 };
 use alloy_rpc_types::{BlockId, BlockNumberOrTag, Filter};
-use alloy_rpc_types_trace::geth::{
-    GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions,
+use alloy_rpc_types_trace::{
+    filter::TraceFilter,
+    geth::{GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions},
+    parity::TraceType,
 };
 use eyre::Result;
 use futures::Future;
@@ -115,6 +117,10 @@ where
                 rpc!(self, get_block_receipts, block_id),
                 rpc_raw!(self, reth_getBalanceChangesInBlock, BalanceChanges, (block_id,)),
                 rpc!(self, trace_block, block_id),
+                rpc!(self, trace_replay_block_transactions, block_id, &[TraceType::StateDiff][..]),
+                rpc!(self, debug_trace_block_by_hash, block_hash, call_tracer_opts()),
+                rpc!(self, debug_trace_block_by_number, block_tag, call_tracer_opts()),
+                rpc!(self, debug_trace_block_by_number, block_tag, prestate_tracer_opts()),
                 get_logs!(self, &Filter::new().select(block_number)),
                 get_logs!(self, &Filter::new().select(block_number).address(vec![
                     "0x6b175474e89094c44da98b954eedeac495271d0f".parse::<Address>().unwrap(), // dai
@@ -128,10 +134,6 @@ where
             for (index, (tx_hash, tx_from)) in
                 block.transactions.txns().map(|t| (t.tx_hash(), t.from)).enumerate()
             {
-                let tracer_opts = GethDebugTracingOptions::default().with_tracer(
-                    GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::CallTracer),
-                );
-
                 if let Some(receipt) = self.rpc2.get_transaction_receipt(tx_hash).await? {
                     if let Some(log) = receipt.inner.inner.logs().first().map(|l| l.address()) {
                         #[rustfmt::skip]
@@ -174,7 +176,9 @@ where
                     // Senders are usually EOAs, but EIP-7702 delegations make sender code
                     // observable.
                     rpc_with_block!(self, get_code_at, tx_from; block_id),
-                    rpc!(self, debug_trace_transaction, tx_hash, tracer_opts),
+                    rpc!(self, trace_transaction, tx_hash),
+                    rpc!(self, debug_trace_transaction, tx_hash, call_tracer_opts()),
+                    rpc!(self, debug_trace_transaction, tx_hash, prestate_tracer_opts()),
                 ];
                 tests.extend(tx_calls);
 
@@ -208,6 +212,24 @@ where
                 .parse::<B256>()
                 .unwrap();
 
+        // Range-indexed counterpart to `eth_getLogs`, backed by the trace index instead of the
+        // log index.
+        let trace_filter = TraceFilter {
+            from_block: Some(start),
+            to_block: Some(end),
+            from_address: vec![],
+            to_address: vec![],
+            mode: Default::default(),
+            after: None,
+            count: None,
+        };
+        let trace_filter_test = Box::pin(self.test_rpc_call(
+            "trace_filter",
+            Some(format!("{trace_filter:?}")),
+            |provider: &P| provider.trace_filter(&trace_filter),
+        ))
+            as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>;
+
         #[rustfmt::skip]
         report(vec![(
             format!("{start}..={end}"),
@@ -217,7 +239,8 @@ where
                     "0x6b175474e89094c44da98b954eedeac495271d0f".parse::<Address>().unwrap(), // dai
                     "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse::<Address>().unwrap(), // usdc
                 ])),
-                get_logs!(self, Filter::new().from_block(start).to_block(end).event_signature(transfer_event_signature))
+                get_logs!(self, Filter::new().from_block(start).to_block(end).event_signature(transfer_event_signature)),
+                trace_filter_test
             ])
             .await,
         )])?;
@@ -310,6 +333,20 @@ where
 
         (name.to_string(), result)
     }
+}
+
+/// Returns tracing options for the geth `callTracer`.
+fn call_tracer_opts() -> GethDebugTracingOptions {
+    GethDebugTracingOptions::default()
+        .with_tracer(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::CallTracer))
+}
+
+/// Returns tracing options for the geth `prestateTracer`.
+///
+/// The prestate tracer surfaces state-read divergence that the call tracer hides.
+fn prestate_tracer_opts() -> GethDebugTracingOptions {
+    GethDebugTracingOptions::default()
+        .with_tracer(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::PreStateTracer))
 }
 
 /// Builder for [`RpcTester`].
