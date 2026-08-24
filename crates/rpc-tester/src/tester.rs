@@ -50,6 +50,9 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Whether to skip extended eth methods not supported by all clients (e.g.,
     /// `eth_getRawTransactionByBlockNumberAndIndex`).
     skip_extended_eth: bool,
+    /// Whether to compare the moving `safe` and `finalized` tags. Requires both nodes to share a
+    /// consensus view.
+    use_finality_tags: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -72,6 +75,7 @@ where
         self.test_per_block(block_range.clone()).await?;
         self.test_block_range(block_range.clone()).await?;
         self.test_negative(*block_range.end()).await?;
+        self.test_tags().await?;
         Ok(())
     }
 
@@ -97,6 +101,12 @@ where
             let mut tests = vec![];
 
             let (block, block_hash, block_tag, block_id) = self.fetch_block(block_number).await?;
+
+            // EIP-1898 block hash object form with require canonical semantics.
+            let canonical_args = (
+                Address::ZERO,
+                serde_json::json!({ "blockHash": block_hash, "requireCanonical": true }),
+            );
 
             #[rustfmt::skip]
             let block_calls = vec![
@@ -124,6 +134,7 @@ where
                 rpc!(self, debug_get_raw_block, block_id),
                 rpc!(self, debug_get_raw_receipts, block_id),
                 rpc_raw!(self, reth_getBalanceChangesInBlock, BalanceChanges, (block_id,)),
+                rpc_raw!(self, eth_getBalance, U256, canonical_args),
                 rpc!(self, trace_block, block_id),
                 rpc!(self, trace_replay_block_transactions, block_id, &[TraceType::StateDiff][..]),
                 rpc!(self, debug_trace_block_by_hash, block_hash, call_tracer_opts()),
@@ -333,6 +344,30 @@ where
         report(vec![("Negative probes".to_string(), futures::future::join_all(tests).await)])
     }
 
+    /// Verifies RPC calls addressed by block tag rather than number or hash.
+    ///
+    /// `earliest` is compared unconditionally since it is pinned to genesis. `safe` and
+    /// `finalized` move with the chain and require both nodes to share a consensus view, so they
+    /// are gated behind the finality tags option.
+    async fn test_tags(&self) -> Result<(), eyre::Error> {
+        #[rustfmt::skip]
+        let mut tests = vec![
+            rpc!(self, get_block_by_number, BlockNumberOrTag::Earliest, alloy_rpc_types::BlockTransactionsKind::Full),
+            rpc!(self, get_block_transaction_count_by_number, BlockNumberOrTag::Earliest),
+            rpc!(self, get_block_receipts, BlockId::Number(BlockNumberOrTag::Earliest)),
+            rpc!(self, get_uncle_count, BlockId::Number(BlockNumberOrTag::Earliest)),
+        ];
+
+        if self.use_finality_tags {
+            for tag in [BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized] {
+                #[rustfmt::skip]
+                tests.push(rpc!(self, get_block_by_number, tag, alloy_rpc_types::BlockTransactionsKind::Hashes));
+            }
+        }
+
+        report(vec![("Block tags".to_string(), futures::future::join_all(tests).await)])
+    }
+
     /// Fetches block and block identifiers from `self.truth`.
     async fn fetch_block(
         &self,
@@ -489,6 +524,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_all_txes: bool,
     /// Whether to skip extended eth methods not supported by all clients.
     skip_extended_eth: bool,
+    /// Whether to compare the moving `safe` and `finalized` tags.
+    use_finality_tags: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -503,6 +540,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_reth: false,
             use_all_txes: false,
             skip_extended_eth: false,
+            use_finality_tags: false,
             rate_limit_rps: None,
         }
     }
@@ -533,6 +571,13 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Enables or disables comparing the moving `safe` and `finalized` tags. Requires both nodes
+    /// to share a consensus view.
+    pub const fn with_finality_tags(mut self, is_enabled: bool) -> Self {
+        self.use_finality_tags = is_enabled;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -549,6 +594,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_reth: self.use_reth,
             use_all_txes: self.use_all_txes,
             skip_extended_eth: self.skip_extended_eth,
+            use_finality_tags: self.use_finality_tags,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
