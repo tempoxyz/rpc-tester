@@ -15,13 +15,15 @@ use std::time::Duration;
 const ALICE: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const BOB: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 
-/// Init code that stores `1` at slot 0, emits a `LOG1` with a fixed topic, and deploys an empty
-/// contract: `PUSH1 1 PUSH1 0 SSTORE PUSH32 topic PUSH1 0 PUSH1 0 LOG1 STOP`.
+/// Init code that stores `1` at slot 0, emits a `LOG2` with two fixed topics, and deploys an
+/// empty contract:
+/// `PUSH1 1 PUSH1 0 SSTORE PUSH32 topic2 PUSH32 topic1 PUSH1 0 PUSH1 0 LOG2 STOP`.
 ///
-/// This gives us a receipt with a log so the receipt-derived `eth_getLogs` filters are exercised,
-/// and non-empty contract storage for the state calls.
+/// This gives us a receipt with a two-topic log so the receipt-derived `eth_getLogs` filters
+/// (signature, positional topic, and multi-topic) are exercised, and non-empty contract storage
+/// for the state calls.
 const LOG_EMITTER_INIT_CODE: &str =
-    "0x60016000557faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa60006000a100";
+    "0x60016000557fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb7faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa60006000a200";
 
 fn provider(anvil: &AnvilInstance) -> impl Provider<AnyNetwork> + Clone {
     ProviderBuilder::new()
