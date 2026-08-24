@@ -26,3 +26,7 @@ pick per log-spaced deep-history stratum (offsets up to 1024, 10000, 100000 and 
 at genesis). Deep samples exercise cold history such as static files and pruned tables that
 near-tip blocks do not, and randomness means repeated runs accumulate coverage instead of
 re-testing the same blocks. The sampled set is logged at startup.
+
+Note that the deep samples query state and replay transactions at historical blocks, which
+assumes both nodes serve full historical state (archive). Also, `--num-blocks` values of 128 or
+more make the tip range swallow the near-history window, dropping those samples.

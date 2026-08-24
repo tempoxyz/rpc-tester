@@ -45,6 +45,12 @@ pub struct CliArgs {
     #[arg(long)]
     pub skip_extended_eth: bool,
 
+    /// Whether to compare the moving `safe` and `finalized` tags.
+    ///
+    /// Requires both nodes to share a consensus view, otherwise the tags can legitimately differ.
+    #[arg(long)]
+    pub use_finality_tags: bool,
+
     /// Maximum time to wait for syncing in seconds
     #[arg(long, value_name = "TIMEOUT", default_value = "300")]
     pub timeout: u64,
@@ -53,12 +59,6 @@ pub struct CliArgs {
     /// If not provided, no rate limiting is applied.
     #[arg(long, value_name = "RATE_LIMIT")]
     pub rate_limit: Option<u32>,
-
-    /// Whether to compare the moving `safe` and `finalized` tags.
-    ///
-    /// Requires both nodes to share a consensus view, otherwise the tags can legitimately differ.
-    #[arg(long)]
-    pub use_finality_tags: bool,
 }
 
 #[tokio::main]
@@ -89,16 +89,14 @@ async fn main() -> eyre::Result<()> {
         .with_rate_limit(args.rate_limit)
         .build();
 
-    // Random historical samples reaching beyond the tip range: near-history picks crossing the
-    // persistence boundary of lazily persisting clients, plus one pick per deep-history stratum
-    // exercising cold storage. Randomness accumulates coverage across repeated runs.
+    // Random historical samples beyond the tip range; see `historical_blocks` for the scheme.
     let mut historical = historical_blocks(*block_range.end(), args.num_blocks as usize);
     historical.retain(|block| !block_range.contains(block));
+    info!(blocks = ?historical, "sampled historical blocks");
 
     // Run both suites to completion before failing so a diff in one does not hide the other.
     let range_result = tester.run(block_range).await;
     if !historical.is_empty() {
-        info!(blocks = ?historical, "testing historical blocks");
         tester.run_blocks(historical).await?;
     }
     range_result
