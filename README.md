@@ -14,6 +14,7 @@ Options:
       --use-all-txes             Whether to query every transaction from a block. Otherwise, the first transaction of each distinct type is sampled
       --skip-extended-eth        Skip extended eth methods not supported by all clients (e.g., `eth_getRawTransactionByBlockNumberAndIndex`)
       --use-finality-tags        Whether to compare the moving `safe` and `finalized` tags
+      --use-execution-witness    Whether to compare `debug_executionWitness` for the newest tested block
       --timeout <TIMEOUT>        Maximum time to wait for syncing in seconds [default: 300]
       --rate-limit <RATE_LIMIT>  Maximum requests per second (rate limit)
   -h, --help                     Print help

@@ -32,6 +32,10 @@ type BlockTestResults = BTreeMap<BlockNumber, Vec<(MethodName, Result<(), TestEr
 
 // Alias type for BalanceChanges
 type BalanceChanges = HashMap<Address, U256>;
+
+// Alias type for raw JSON responses compared structurally, e.g. the execution witness, whose
+// schema differs across clients.
+type JsonValue = serde_json::Value;
 /// Type that runs queries two nodes rpc queries and ensures that the first is at least a superset
 /// of the second.
 #[derive(Debug)]
@@ -53,6 +57,9 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Whether to compare the moving `safe` and `finalized` tags. Requires both nodes to share a
     /// consensus view.
     use_finality_tags: bool,
+    /// Whether to compare `debug_executionWitness` for the newest tested block. Witness
+    /// generation re-executes the block, so this is opt-in.
+    use_execution_witness: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -79,7 +86,8 @@ where
         let block_range_result = self.test_block_range(block_range.clone()).await;
         let negative = self.test_negative(*block_range.end()).await;
         let tags = self.test_tags().await;
-        per_block.and(block_range_result).and(negative).and(tags)
+        let witness = self.test_execution_witness(*block_range.end()).await;
+        per_block.and(block_range_result).and(negative).and(tags).and(witness)
     }
 
     /// Verifies RPC calls applicable to single blocks for each of the given blocks.
@@ -400,6 +408,25 @@ where
         report(vec![("Block tags".to_string(), futures::future::join_all(tests).await)])
     }
 
+    /// Verifies `debug_executionWitness` for the newest tested block.
+    ///
+    /// The witness contains every piece of state touched while re-executing the block, making it
+    /// a dense probe of execution and state-read parity. Generation re-executes the block and is
+    /// expensive, so this is opt-in and runs only for the single newest block.
+    async fn test_execution_witness(&self, head: BlockNumber) -> Result<(), eyre::Error> {
+        if !self.use_execution_witness {
+            return Ok(());
+        }
+
+        let witness_args = (BlockNumberOrTag::Number(head),);
+        #[rustfmt::skip]
+        let tests = vec![
+            rpc_raw!(self, debug_executionWitness, JsonValue, witness_args),
+        ];
+
+        report(vec![("Execution witness".to_string(), futures::future::join_all(tests).await)])
+    }
+
     /// Fetches the block and its identifiers from `rpc2`, verifying both nodes agree on the
     /// canonical hash.
     ///
@@ -494,10 +521,15 @@ where
     {
         // The debug namespace is gated together with tracing: `debug_getRaw*` are typically
         // enabled alongside the trace methods, and running them against nodes without the
-        // namespace would fail every block.
-        if name.starts_with("reth") && !self.use_reth ||
-            (name.contains("trace") || name.starts_with("debug")) && !self.use_tracing
-        {
+        // namespace would fail every block. `debug_executionWitness` has its own opt-in,
+        // independent of the tracing gate.
+        let skip = if name == "debug_executionWitness" {
+            !self.use_execution_witness
+        } else {
+            name.starts_with("reth") && !self.use_reth ||
+                (name.contains("trace") || name.starts_with("debug")) && !self.use_tracing
+        };
+        if skip {
             return (name.to_string(), Ok(()));
         }
 
@@ -615,6 +647,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     skip_extended_eth: bool,
     /// Whether to compare the moving `safe` and `finalized` tags.
     use_finality_tags: bool,
+    /// Whether to compare `debug_executionWitness` for the newest tested block.
+    use_execution_witness: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -630,6 +664,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_all_txes: false,
             skip_extended_eth: false,
             use_finality_tags: false,
+            use_execution_witness: false,
             rate_limit_rps: None,
         }
     }
@@ -667,6 +702,13 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Enables or disables comparing `debug_executionWitness` for the newest tested block.
+    /// Witness generation re-executes the block, so this is opt-in.
+    pub const fn with_execution_witness(mut self, is_enabled: bool) -> Self {
+        self.use_execution_witness = is_enabled;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -684,6 +726,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_all_txes: self.use_all_txes,
             skip_extended_eth: self.skip_extended_eth,
             use_finality_tags: self.use_finality_tags,
+            use_execution_witness: self.use_execution_witness,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
