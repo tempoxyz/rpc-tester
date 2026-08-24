@@ -29,7 +29,8 @@ type MethodName = String;
 #[macro_export]
 macro_rules! rpc {
     ($self:expr, $method:ident $(, $args:expr )* ) => {{
-        let args_str = Some(format!("{}", [$(format!("{:?}", $args)),*].join(", ")));
+        let args: Vec<String> = vec![$(format!("{:?}", $args)),*];
+        let args_str = (!args.is_empty()).then(|| args.join(", "));
         Box::pin($self.test_rpc_call(
             stringify!($method),
             args_str,
