@@ -547,11 +547,19 @@ where
                 if rpc1 == rpc2 {
                     Ok(())
                 } else {
-                    Err(TestError::Diff {
-                        rpc1: serde_json::to_value(&rpc1).expect("should json"),
-                        rpc2: serde_json::to_value(&rpc2).expect("should json"),
-                        args,
-                    })
+                    let mut rpc1 = serde_json::to_value(&rpc1).expect("should json");
+                    let mut rpc2 = serde_json::to_value(&rpc2).expect("should json");
+
+                    if name == "eth_createAccessList" {
+                        normalize_access_list_result(&mut rpc1);
+                        normalize_access_list_result(&mut rpc2);
+                    }
+
+                    if rpc1 == rpc2 {
+                        Ok(())
+                    } else {
+                        Err(TestError::Diff { rpc1, rpc2, args })
+                    }
                 }
             }
             // Both nodes rejecting the call with the same error response is agreement, e.g. a
@@ -576,6 +584,28 @@ where
 
         (name.to_string(), result)
     }
+}
+
+/// Canonicalizes the set-like arrays in an `eth_createAccessList` result.
+///
+/// Access-list item and storage-key ordering does not affect execution, and clients may return
+/// equivalent lists in different orders.
+fn normalize_access_list_result(value: &mut JsonValue) {
+    let Some(access_list) = value.get_mut("accessList").and_then(JsonValue::as_array_mut) else {
+        return
+    };
+
+    for item in access_list.iter_mut() {
+        if let Some(storage_keys) = item.get_mut("storageKeys").and_then(JsonValue::as_array_mut) {
+            storage_keys.sort_unstable_by(|a, b| a.as_str().cmp(&b.as_str()));
+        }
+    }
+
+    access_list.sort_unstable_by(|a, b| {
+        a.get("address")
+            .and_then(JsonValue::as_str)
+            .cmp(&b.get("address").and_then(JsonValue::as_str))
+    });
 }
 
 /// Builds an `eth_call` request object from a transaction response's JSON, keeping a minimal
@@ -738,6 +768,7 @@ mod tests {
     use super::*;
     use alloy_json_rpc::ErrorPayload;
     use alloy_transport::TransportErrorKind;
+    use serde_json::json;
 
     fn error_resp(code: i64, message: &str) -> TransportError {
         TransportError::ErrorResp(ErrorPayload {
@@ -796,5 +827,31 @@ mod tests {
             &TransportErrorKind::backend_gone()
         ));
         assert!(!errors_match(&TransportErrorKind::backend_gone(), &error_resp(-32000, "a")));
+    }
+
+    #[test]
+    fn normalizes_access_list_item_and_storage_key_order() {
+        let mut rpc1 = json!({
+            "accessList": [
+                {"address": "0xbb", "storageKeys": ["0x02", "0x01"]},
+                {"address": "0xaa", "storageKeys": []}
+            ],
+            "gasUsed": "0x1234"
+        });
+        let mut rpc2 = json!({
+            "accessList": [
+                {"address": "0xaa", "storageKeys": []},
+                {"address": "0xbb", "storageKeys": ["0x01", "0x02"]}
+            ],
+            "gasUsed": "0x1234"
+        });
+
+        normalize_access_list_result(&mut rpc1);
+        normalize_access_list_result(&mut rpc2);
+
+        assert_eq!(rpc1, rpc2);
+
+        rpc2["gasUsed"] = json!("0x1235");
+        assert_ne!(rpc1, rpc2);
     }
 }
