@@ -1,4 +1,4 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.86.0 AS chef
 WORKDIR /app
 
 LABEL org.opencontainers.image.source=https://github.com/tempoxyz/rpc-tester
@@ -27,14 +27,17 @@ RUN cargo build --locked --release
 # binary to a temporary location
 RUN cp /app/target/release/rpc-tester-cli /app/rpc-tester-cli
 
-# Install nushell
-RUN NUSHELL_VERSION=$(curl -s https://api.github.com/repos/nushell/nushell/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/') && \
-    curl -fsSL https://github.com/nushell/nushell/releases/download/${NUSHELL_VERSION}/nu-${NUSHELL_VERSION#v}-x86_64-unknown-linux-gnu.tar.gz | tar -xz && \
-    mv nu-*-x86_64-unknown-linux-gnu/nu /usr/local/bin/nu && \
-    rm -rf nu-*-x86_64-unknown-linux-gnu
+# Install nushell (pinned version with checksum verification)
+ENV NUSHELL_VERSION=0.103.0
+ENV NUSHELL_SHA256=8d765a31611b3ae8fb63582a53b39111c11e2a3a6be3c76afb2c0a4bb38eebee
+RUN curl -fsSL https://github.com/nushell/nushell/releases/download/${NUSHELL_VERSION}/nu-${NUSHELL_VERSION}-x86_64-unknown-linux-gnu.tar.gz -o /tmp/nu.tar.gz && \
+    echo "${NUSHELL_SHA256}  /tmp/nu.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/nu.tar.gz -C /tmp && \
+    mv /tmp/nu-${NUSHELL_VERSION}-x86_64-unknown-linux-gnu/nu /usr/local/bin/nu && \
+    rm -rf /tmp/nu*
 
 # Use Ubuntu as the release image
-FROM ubuntu AS runtime
+FROM ubuntu:24.04 AS runtime
 WORKDIR /app
 
 # Install runtime dependencies
