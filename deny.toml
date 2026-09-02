@@ -5,6 +5,9 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
     "RUSTSEC-2024-0436", # paste — unmaintained, transitive via alloy-primitives, no fix available
     "RUSTSEC-2025-0134", # rustls-pemfile — unmaintained, transitive via reqwest, no fix available
+    "RUSTSEC-2026-0002", # lru — transitive via alloy-provider 0.11, requires an Alloy upgrade
+    "RUSTSEC-2026-0173", # proc-macro-error2 — unmaintained, transitive via Alloy, no fix available
+    "RUSTSEC-2026-0253", # lru — transitive via alloy-provider 0.11, requires an Alloy upgrade
 ]
 
 [bans]
