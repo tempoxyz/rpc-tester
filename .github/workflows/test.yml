@@ -21,5 +21,5 @@ jobs:
         with:
           cache-on-failure: true
       # Installs anvil, used by the same-node self-test.
-      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+      - uses: tempoxyz/gh-actions/actions/setup-foundry@487be2d19b0ba9ae1903143016444ab752c3e939
       - run: cargo test --workspace --all-features --locked
