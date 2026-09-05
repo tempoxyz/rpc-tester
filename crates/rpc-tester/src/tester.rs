@@ -60,9 +60,6 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Whether to compare `debug_executionWitness` for the newest tested block. Witness
     /// generation re-executes the block, so this is opt-in.
     use_execution_witness: bool,
-    /// Whether to compare the poll-based filter API. Filters are node-local state, so this needs
-    /// endpoints that route every request to the same backend.
-    use_filters: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -437,13 +434,8 @@ where
     /// runs the same scenario against each node and compares what the scenarios observed, reduced
     /// to what holds on any correct node no matter when blocks and transactions arrive (see
     /// [`filters`]). The scenarios wait for the chain to move, which makes this suite slower than
-    /// the others, and they need endpoints that route every request to the same backend, so it is
-    /// opt-in.
+    /// the others, and they need endpoints that route every request to the same backend.
     async fn test_filters(&self, block_range: RangeInclusive<u64>) -> Result<(), eyre::Error> {
-        if !self.use_filters {
-            return Ok(());
-        }
-
         let start = *block_range.start();
         let end = *block_range.end();
         let addresses = vec![
@@ -751,8 +743,6 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_finality_tags: bool,
     /// Whether to compare `debug_executionWitness` for the newest tested block.
     use_execution_witness: bool,
-    /// Whether to compare the poll-based filter API.
-    use_filters: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -769,7 +759,6 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: false,
             use_finality_tags: false,
             use_execution_witness: false,
-            use_filters: false,
             rate_limit_rps: None,
         }
     }
@@ -814,14 +803,6 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
-    /// Enables or disables comparing the poll-based filter API (`eth_newFilter`,
-    /// `eth_getFilterChanges`, ...). Filters are node-local state, so this needs endpoints that
-    /// route every request to the same backend.
-    pub const fn with_filters(mut self, is_enabled: bool) -> Self {
-        self.use_filters = is_enabled;
-        self
-    }
-
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -840,7 +821,6 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: self.skip_extended_eth,
             use_finality_tags: self.use_finality_tags,
             use_execution_witness: self.use_execution_witness,
-            use_filters: self.use_filters,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
