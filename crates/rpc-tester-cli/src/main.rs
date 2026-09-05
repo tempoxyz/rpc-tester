@@ -57,6 +57,15 @@ pub struct CliArgs {
     #[arg(long)]
     pub use_execution_witness: bool,
 
+    /// Whether to compare the poll-based filter API.
+    ///
+    /// Covers `eth_newFilter`, `eth_newPendingTransactionFilter`, `eth_getFilterChanges`,
+    /// `eth_getFilterLogs` and `eth_uninstallFilter`. Filters are node-local state, so both
+    /// endpoints must route every request to the same backend. The scenarios wait for the chain
+    /// to advance, which slows the run down.
+    #[arg(long)]
+    pub use_filters: bool,
+
     /// Maximum time to wait for syncing in seconds
     #[arg(long, value_name = "TIMEOUT", default_value = "300")]
     pub timeout: u64,
@@ -93,6 +102,7 @@ async fn main() -> eyre::Result<()> {
         .skip_extended_eth(args.skip_extended_eth)
         .with_finality_tags(args.use_finality_tags)
         .with_execution_witness(args.use_execution_witness)
+        .with_filters(args.use_filters)
         .with_rate_limit(args.rate_limit)
         .build();
 

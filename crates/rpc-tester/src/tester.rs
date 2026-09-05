@@ -1,14 +1,14 @@
 //! [`RpcTester`] implementation.
 
 use super::{MethodName, TestError};
-use crate::{get_logs, report::report, rpc, rpc_raw, rpc_with_block};
+use crate::{filters, get_logs, report::report, rpc, rpc_raw, rpc_with_block};
 use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, B256, U256};
 use alloy_provider::{
     ext::{DebugApi, TraceApi},
     network::{AnyNetwork, AnyRpcBlock, TransactionResponse},
     Provider,
 };
-use alloy_rpc_types::{AccessListResult, BlockId, BlockNumberOrTag, Filter};
+use alloy_rpc_types::{AccessListResult, BlockId, BlockNumberOrTag, Filter, FilterId};
 use alloy_rpc_types_trace::{
     filter::TraceFilter,
     geth::{GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions},
@@ -60,6 +60,9 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Whether to compare `debug_executionWitness` for the newest tested block. Witness
     /// generation re-executes the block, so this is opt-in.
     use_execution_witness: bool,
+    /// Whether to compare the poll-based filter API. Filters are node-local state, so this needs
+    /// endpoints that route every request to the same backend.
+    use_filters: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -87,7 +90,8 @@ where
         let negative = self.test_negative(*block_range.end()).await;
         let tags = self.test_tags().await;
         let witness = self.test_execution_witness(*block_range.end()).await;
-        per_block.and(block_range_result).and(negative).and(tags).and(witness)
+        let filters = self.test_filters(block_range).await;
+        per_block.and(block_range_result).and(negative).and(tags).and(witness).and(filters)
     }
 
     /// Verifies RPC calls applicable to single blocks for each of the given blocks.
@@ -427,6 +431,73 @@ where
         report(vec![("Execution witness".to_string(), futures::future::join_all(tests).await)])
     }
 
+    /// Verifies the poll-based filter API.
+    ///
+    /// Filters are node-local state, so the nodes cannot be sent identical requests. Every test
+    /// runs the same scenario against each node and compares what the scenarios observed, reduced
+    /// to what holds on any correct node no matter when blocks and transactions arrive (see
+    /// [`filters`]). The scenarios wait for the chain to move, which makes this suite slower than
+    /// the others, and they need endpoints that route every request to the same backend, so it is
+    /// opt-in.
+    async fn test_filters(&self, block_range: RangeInclusive<u64>) -> Result<(), eyre::Error> {
+        if !self.use_filters {
+            return Ok(());
+        }
+
+        let start = *block_range.start();
+        let end = *block_range.end();
+        let addresses = vec![
+            "0x6b175474e89094c44da98b954eedeac495271d0f".parse::<Address>().unwrap(), // dai
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse::<Address>().unwrap(), // usdc
+        ];
+
+        // The tested range, served as history through `eth_getFilterLogs`.
+        let range_filter = Filter::new().from_block(start).to_block(end).address(addresses.clone());
+        // A filter that already covers history when it is installed, which polls must not rescan.
+        let watch_filter = Filter::new().from_block(start).address(addresses.clone());
+        // A `toBlock` ahead of the chain bounds the filter, not the poll.
+        let future_filter =
+            Filter::new().from_block(start).to_block(end + 1_000_000).address(addresses);
+        let missing_args = (FilterId::Str("0xdeadbeef".to_string()),);
+
+        let filter_logs = Box::pin(self.test_rpc_call(
+            "eth_getFilterLogs",
+            Some(format!("{range_filter:?}")),
+            |provider: &P| filters::filter_logs(provider, &range_filter),
+        ))
+            as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>;
+        let watch_polls = Box::pin(self.test_rpc_call(
+            "eth_getFilterChanges",
+            Some(format!("{watch_filter:?}")),
+            |provider: &P| filters::poll_log_filter(provider, &watch_filter),
+        ))
+            as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>;
+        let future_polls = Box::pin(self.test_rpc_call(
+            "eth_getFilterChanges",
+            Some(format!("{future_filter:?}")),
+            |provider: &P| filters::poll_log_filter(provider, &future_filter),
+        ))
+            as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>;
+        let pending_polls = Box::pin(self.test_rpc_call(
+            "eth_getFilterChanges",
+            Some("pending transactions".to_string()),
+            |provider: &P| filters::poll_pending_transaction_filter(provider),
+        ))
+            as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>;
+
+        #[rustfmt::skip]
+        let tests = vec![
+            filter_logs,
+            watch_polls,
+            future_polls,
+            pending_polls,
+            // Uninstalling an unknown filter is a plain `false`, not an error.
+            rpc_raw!(self, eth_uninstallFilter, bool, missing_args),
+        ];
+
+        report(vec![("Filters".to_string(), futures::future::join_all(tests).await)])
+    }
+
     /// Fetches the block and its identifiers from `rpc2`, verifying both nodes agree on the
     /// canonical hash.
     ///
@@ -489,7 +560,8 @@ where
     ///
     /// The limit is applied per test, and each test issues one request per node, so an endpoint
     /// serving both roles receives up to twice the configured rate. `eth_getLogs` pagination
-    /// retries and block/receipt prefetches are not throttled.
+    /// retries, block/receipt prefetches and the requests within a filter scenario are not
+    /// throttled.
     async fn apply_rate_limit(&self) {
         if let Some(rps) = self.rate_limit_rps {
             let min_interval = std::time::Duration::from_secs_f64(1.0 / rps as f64);
@@ -679,6 +751,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_finality_tags: bool,
     /// Whether to compare `debug_executionWitness` for the newest tested block.
     use_execution_witness: bool,
+    /// Whether to compare the poll-based filter API.
+    use_filters: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -695,6 +769,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: false,
             use_finality_tags: false,
             use_execution_witness: false,
+            use_filters: false,
             rate_limit_rps: None,
         }
     }
@@ -739,6 +814,14 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Enables or disables comparing the poll-based filter API (`eth_newFilter`,
+    /// `eth_getFilterChanges`, ...). Filters are node-local state, so this needs endpoints that
+    /// route every request to the same backend.
+    pub const fn with_filters(mut self, is_enabled: bool) -> Self {
+        self.use_filters = is_enabled;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -757,6 +840,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: self.skip_extended_eth,
             use_finality_tags: self.use_finality_tags,
             use_execution_witness: self.use_execution_witness,
+            use_filters: self.use_filters,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
