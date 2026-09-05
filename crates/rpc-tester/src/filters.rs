@@ -38,7 +38,8 @@ pub(crate) struct LogFilterPolls {
     /// Logs of blocks below the head at install time. A poll only reports what is new since the
     /// filter was installed; the history a filter covers is served by `eth_getFilterLogs`.
     logs_below_install_head: usize,
-    /// Logs of the second poll that the first one had already delivered.
+    /// Logs of the second poll that the first one had already delivered. A log a reorg removed
+    /// is announced again with `removed` set, which is not a repeat.
     repeated_logs: usize,
 }
 
@@ -88,7 +89,10 @@ async fn poll_log_filter_twice<P: Provider<AnyNetwork>>(
             .chain(&second)
             .filter(|log| log.block_number.is_some_and(|number| number < install_head))
             .count(),
-        repeated_logs: second.iter().filter(|log| delivered.contains(&log_key(log))).count(),
+        repeated_logs: second
+            .iter()
+            .filter(|log| !log.removed && delivered.contains(&log_key(log)))
+            .count(),
     })
 }
 
