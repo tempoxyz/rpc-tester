@@ -7,7 +7,7 @@
 use alloy_node_bindings::{Anvil, AnvilInstance};
 use alloy_primitives::B256;
 use alloy_provider::{network::AnyNetwork, Provider, ProviderBuilder};
-use rpc_tester::RpcTester;
+use rpc_tester::{filters, RpcTester};
 use serde_json::json;
 use std::time::Duration;
 
@@ -74,6 +74,49 @@ async fn same_node_passes() {
 
     // Sampled non-contiguous blocks, as used by historical mode.
     tester.run_blocks([0, head]).await.expect("same node must be a superset of itself");
+}
+
+/// The pending transaction filter scenario has to see a transaction that enters the pool while
+/// block production is held, so its delivery cannot be attributed to a new block.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_transaction_filter_drains_without_new_block() {
+    let anvil = Anvil::new().arg("--no-mining").try_spawn().expect("anvil must be installed");
+    let provider = provider(&anvil);
+
+    let submit = {
+        let provider = provider.clone();
+        tokio::spawn(async move {
+            // land between the scenario's polls
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let hash: B256 = provider
+                .raw_request(
+                    "eth_sendTransaction".into(),
+                    [json!({ "from": ALICE, "to": BOB, "value": "0x2540be400" })],
+                )
+                .await
+                .expect("send tx");
+            let tx = provider
+                .get_transaction_by_hash(hash)
+                .await
+                .expect("get tx")
+                .expect("transaction must have been admitted to the pool");
+            assert!(tx.block_number.is_none(), "block production must be held");
+            hash
+        })
+    };
+
+    let (polls, _hash) =
+        tokio::join!(filters::poll_pending_transaction_filter(&provider, "anvil"), submit);
+    let polls = polls.expect("scenario must succeed");
+
+    assert_eq!(polls.poll_error, None);
+    assert_eq!(polls.repeated_hashes, 0);
+    assert!(
+        polls.polls.iter().any(|poll| poll.hashes > 0 && !poll.after_new_block),
+        "the transaction must be delivered by a poll no new block precedes, got {:?}",
+        polls.polls
+    );
+    assert!(!filters::suggests_head_gating(&polls.polls));
 }
 
 #[tokio::test(flavor = "multi_thread")]

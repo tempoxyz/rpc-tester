@@ -2,6 +2,8 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 #[doc(hidden)]
+pub mod filters;
+#[doc(hidden)]
 pub mod get_logs;
 mod tester;
 pub use tester::RpcTester;
