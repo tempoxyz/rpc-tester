@@ -1,7 +1,8 @@
 //! rpc-tester library
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-mod filters;
+#[doc(hidden)]
+pub mod filters;
 #[doc(hidden)]
 pub mod get_logs;
 mod tester;

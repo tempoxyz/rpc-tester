@@ -446,10 +446,9 @@ where
         // The tested range, served as history through `eth_getFilterLogs`.
         let range_filter = Filter::new().from_block(start).to_block(end).address(addresses.clone());
         // A filter that already covers history when it is installed, which polls must not rescan.
-        let watch_filter = Filter::new().from_block(start).address(addresses.clone());
-        // A `toBlock` ahead of the chain bounds the filter, not the poll.
-        let future_filter =
-            Filter::new().from_block(start).to_block(end + 1_000_000).address(addresses);
+        // The future variant additionally bounds it with a `toBlock` far ahead of the node's head,
+        // which bounds the filter, not the poll.
+        let watch_filter = Filter::new().from_block(start).address(addresses);
         let missing_args = (FilterId::Str("0xdeadbeef".to_string()),);
 
         let filter_logs = Box::pin(self.test_rpc_call(
@@ -466,14 +465,21 @@ where
             as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>;
         let future_polls = Box::pin(self.test_rpc_call(
             "eth_getFilterChanges",
-            Some(format!("{future_filter:?}")),
-            |provider: &P| filters::poll_log_filter(provider, &future_filter),
+            Some(format!(
+                "{watch_filter:?} with toBlock {} blocks ahead of the head",
+                filters::FUTURE_TO_BLOCK_OFFSET
+            )),
+            |provider: &P| filters::poll_future_to_block_filter(provider, &watch_filter),
         ))
             as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>;
         let pending_polls = Box::pin(self.test_rpc_call(
             "eth_getFilterChanges",
             Some("pending transactions".to_string()),
-            |provider: &P| filters::poll_pending_transaction_filter(provider),
+            |provider: &P| {
+                let node =
+                    if std::ptr::eq(provider, &raw const self.rpc1) { "rpc1" } else { "rpc2" };
+                filters::poll_pending_transaction_filter(provider, node)
+            },
         ))
             as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>;
 

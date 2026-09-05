@@ -15,13 +15,19 @@ use std::{
     collections::HashSet,
     time::{Duration, Instant},
 };
+use tracing::warn;
 
 /// How long a log filter scenario gives the chain to advance between its two polls.
 ///
 /// Slightly more than a mainnet slot, so that on a live chain the second poll usually covers a
 /// new block. If the chain does not advance in time the second poll is made anyway and has to be
 /// empty.
-pub(crate) const NEW_BLOCK_WAIT: Duration = Duration::from_secs(15);
+pub const NEW_BLOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// How far ahead of the head [`poll_future_to_block_filter`] places the filter's `toBlock`.
+///
+/// Far enough that no chain reaches it while the scenario runs.
+pub const FUTURE_TO_BLOCK_OFFSET: u64 = 1_000_000;
 
 /// Number of polls of a pending transaction filter after the first one.
 const PENDING_POLLS: usize = 5;
@@ -31,34 +37,61 @@ const PENDING_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// What polling a log filter twice observed, see [`poll_log_filter`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct LogFilterPolls {
+pub struct LogFilterPolls {
     /// The error a poll failed with. A `toBlock` ahead of the chain bounds the filter's range, not
     /// the poll, so it must not fail the poll.
-    poll_error: Option<String>,
+    pub poll_error: Option<String>,
     /// Logs of blocks below the head at install time. A poll only reports what is new since the
     /// filter was installed; the history a filter covers is served by `eth_getFilterLogs`.
-    logs_below_install_head: usize,
+    pub logs_below_install_head: usize,
     /// Logs of the second poll that the first one had already delivered. A log a reorg removed
     /// is announced again with `removed` set, which is not a repeat.
-    repeated_logs: usize,
+    pub repeated_logs: usize,
 }
 
 /// Installs `filter`, polls it, gives the chain [`NEW_BLOCK_WAIT`] to advance, polls it again and
 /// uninstalls it.
-pub(crate) async fn poll_log_filter<P: Provider<AnyNetwork>>(
+pub async fn poll_log_filter<P: Provider<AnyNetwork>>(
     provider: &P,
     filter: &Filter,
 ) -> TransportResult<LogFilterPolls> {
     // Read the head before installing: a block landing in between can then only raise the head
     // the node installs the filter at, never lower it below this one.
     let install_head = provider.get_block_number().await?;
+    install_and_poll_twice(provider, filter, install_head).await
+}
+
+/// Like [`poll_log_filter`], with the filter's `toBlock` moved [`FUTURE_TO_BLOCK_OFFSET`] blocks
+/// past the head the node reports.
+///
+/// The bound is derived from the node's head rather than from the range under test so that it is
+/// ahead of the chain no matter how far back that range lies.
+pub async fn poll_future_to_block_filter<P: Provider<AnyNetwork>>(
+    provider: &P,
+    filter: &Filter,
+) -> TransportResult<LogFilterPolls> {
+    let install_head = provider.get_block_number().await?;
+    install_and_poll_twice(provider, &with_future_to_block(filter, install_head), install_head)
+        .await
+}
+
+/// Returns `filter` with its `toBlock` set [`FUTURE_TO_BLOCK_OFFSET`] blocks past `head`.
+pub fn with_future_to_block(filter: &Filter, head: BlockNumber) -> Filter {
+    filter.clone().to_block(head.saturating_add(FUTURE_TO_BLOCK_OFFSET))
+}
+
+async fn install_and_poll_twice<P: Provider<AnyNetwork>>(
+    provider: &P,
+    filter: &Filter,
+    install_head: BlockNumber,
+) -> TransportResult<LogFilterPolls> {
     let id: FilterId = provider.raw_request("eth_newFilter".into(), (filter,)).await?;
-    let outcome = poll_log_filter_twice(provider, &id, install_head).await;
+    let outcome = poll_twice(provider, &id, install_head).await;
     uninstall(provider, &id).await;
     outcome
 }
 
-async fn poll_log_filter_twice<P: Provider<AnyNetwork>>(
+async fn poll_twice<P: Provider<AnyNetwork>>(
     provider: &P,
     id: &FilterId,
     install_head: BlockNumber,
@@ -97,7 +130,7 @@ async fn poll_log_filter_twice<P: Provider<AnyNetwork>>(
 }
 
 /// Installs `filter` and returns what `eth_getFilterLogs` serves for it.
-pub(crate) async fn filter_logs<P: Provider<AnyNetwork>>(
+pub async fn filter_logs<P: Provider<AnyNetwork>>(
     provider: &P,
     filter: &Filter,
 ) -> TransportResult<Vec<Log>> {
@@ -109,25 +142,60 @@ pub(crate) async fn filter_logs<P: Provider<AnyNetwork>>(
 
 /// What polling a pending transaction filter observed, see
 /// [`poll_pending_transaction_filter`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct PendingTransactionFilterPolls {
+///
+/// Only the error and the repeats take part in the comparison. When the hashes arrived relative
+/// to new blocks depends on when the pool saw the transactions, which two correct nodes can
+/// legitimately see on different sides of a block boundary, so the polls themselves are kept for
+/// diagnostics only.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingTransactionFilterPolls {
     /// The error a poll failed with.
-    poll_error: Option<String>,
+    pub poll_error: Option<String>,
     /// Hashes a poll repeated from an earlier one.
-    repeated_hashes: usize,
-    /// Transactions only ever arrived in polls that followed a new block although the node did
-    /// announce some, so the filter drains the pool on head progress instead of on every poll.
-    gated_on_new_blocks: bool,
+    pub repeated_hashes: usize,
+    /// The polls as observed, see [`suggests_head_gating`].
+    #[serde(skip)]
+    pub polls: Vec<PendingPoll>,
+}
+
+impl PartialEq for PendingTransactionFilterPolls {
+    fn eq(&self, other: &Self) -> bool {
+        self.poll_error == other.poll_error && self.repeated_hashes == other.repeated_hashes
+    }
+}
+
+impl Eq for PendingTransactionFilterPolls {}
+
+/// One poll of a pending transaction filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingPoll {
+    /// Whether the head moved since the previous poll.
+    pub after_new_block: bool,
+    /// Number of hashes the poll delivered.
+    pub hashes: usize,
 }
 
 /// Installs a pending transaction filter, polls it every [`PENDING_POLL_INTERVAL`] and uninstalls
-/// it.
-pub(crate) async fn poll_pending_transaction_filter<P: Provider<AnyNetwork>>(
+/// it. `node` names the node in the diagnostic for polls that look gated on head progress.
+pub async fn poll_pending_transaction_filter<P: Provider<AnyNetwork>>(
     provider: &P,
+    node: &str,
 ) -> TransportResult<PendingTransactionFilterPolls> {
     let id: FilterId = provider.raw_request("eth_newPendingTransactionFilter".into(), ()).await?;
     let outcome = poll_pending_transactions(provider, &id).await;
     uninstall(provider, &id).await;
+
+    if let Ok(outcome) = &outcome {
+        if suggests_head_gating(&outcome.polls) {
+            warn!(
+                node,
+                polls = ?outcome.polls,
+                "pending transactions only arrived in polls that followed a new block, which is \
+                 what a filter gated on head progress looks like; a live node cannot prove this \
+                 either way, so it is not compared"
+            );
+        }
+    }
     outcome
 }
 
@@ -151,7 +219,7 @@ async fn poll_pending_transactions<P: Provider<AnyNetwork>>(
                 return Ok(PendingTransactionFilterPolls {
                     poll_error: Some(error),
                     repeated_hashes,
-                    gated_on_new_blocks: false,
+                    polls,
                 })
             }
         };
@@ -160,27 +228,17 @@ async fn poll_pending_transactions<P: Provider<AnyNetwork>>(
         head = current;
     }
 
-    Ok(PendingTransactionFilterPolls {
-        poll_error: None,
-        repeated_hashes,
-        gated_on_new_blocks: gated_on_new_blocks(&polls),
-    })
+    Ok(PendingTransactionFilterPolls { poll_error: None, repeated_hashes, polls })
 }
 
-/// One poll of a pending transaction filter.
-#[derive(Debug, Clone, Copy)]
-struct PendingPoll {
-    /// Whether the head moved since the previous poll.
-    after_new_block: bool,
-    /// Number of hashes the poll delivered.
-    hashes: usize,
-}
-
-/// Whether the polls after the first one only ever delivered transactions right after a new block.
+/// Whether the polls after the first one only ever delivered transactions right after a new
+/// block, which is how a filter gated on head progress behaves.
 ///
-/// The first poll drains what accumulated since the install and says nothing about gating. A
-/// chain without transactions delivers nothing at all, which is not gating either.
-fn gated_on_new_blocks(polls: &[PendingPoll]) -> bool {
+/// This is a hint, not proof: a correct node whose only transactions happened to arrive in the
+/// poll intervals that also contained a new block looks the same. The first poll drains what
+/// accumulated since the install and says nothing about gating, and a chain without transactions
+/// delivers nothing at all, which is not gating either.
+pub fn suggests_head_gating(polls: &[PendingPoll]) -> bool {
     let later = polls.get(1..).unwrap_or_default();
     later.iter().any(|poll| poll.hashes > 0) &&
         later.iter().all(|poll| poll.hashes == 0 || poll.after_new_block)
@@ -229,29 +287,58 @@ const fn log_key(log: &Log) -> (Option<B256>, Option<B256>, Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_rpc_types::BlockNumberOrTag;
 
     const fn poll(after_new_block: bool, hashes: usize) -> PendingPoll {
         PendingPoll { after_new_block, hashes }
     }
 
+    fn outcome(polls: Vec<PendingPoll>) -> PendingTransactionFilterPolls {
+        PendingTransactionFilterPolls { poll_error: None, repeated_hashes: 0, polls }
+    }
+
     #[test]
-    fn gating_needs_deliveries_that_only_follow_new_blocks() {
+    fn future_to_block_is_ahead_of_the_head_for_any_range() {
+        let head = 20_000_000;
+        // a range far more than the offset behind the head
+        let filter = Filter::new().from_block(1_000u64).to_block(2_000u64);
+        let future = with_future_to_block(&filter, head);
+        assert_eq!(future.get_from_block(), Some(1_000));
+        assert!(matches!(
+            future.block_option.get_to_block(),
+            Some(BlockNumberOrTag::Number(to)) if *to > head
+        ));
+    }
+
+    #[test]
+    fn head_gating_hint_needs_deliveries_that_only_follow_new_blocks() {
         // a pool that is drained on every poll
-        assert!(!gated_on_new_blocks(&[
+        assert!(!suggests_head_gating(&[
             poll(false, 3),
             poll(false, 2),
             poll(true, 5),
             poll(false, 1)
         ]));
         // a filter that only reports once the head moved
-        assert!(gated_on_new_blocks(&[
+        assert!(suggests_head_gating(&[
             poll(false, 3),
             poll(false, 0),
             poll(true, 5),
             poll(false, 0)
         ]));
         // nothing announced at all, and the first poll does not count
-        assert!(!gated_on_new_blocks(&[poll(true, 3), poll(false, 0), poll(false, 0)]));
-        assert!(!gated_on_new_blocks(&[poll(false, 3)]));
+        assert!(!suggests_head_gating(&[poll(true, 3), poll(false, 0), poll(false, 0)]));
+        assert!(!suggests_head_gating(&[poll(false, 3)]));
+    }
+
+    #[test]
+    fn transaction_arrival_timing_does_not_split_correct_nodes() {
+        // the same single transaction seen on either side of a block boundary, both valid for a
+        // filter that drains on every poll, so the hint differs but the outcomes compare equal
+        let before_block = vec![poll(false, 0), poll(true, 1), poll(false, 0)];
+        let after_block = vec![poll(false, 0), poll(false, 1), poll(true, 0)];
+        assert!(suggests_head_gating(&before_block));
+        assert!(!suggests_head_gating(&after_block));
+        assert_eq!(outcome(before_block), outcome(after_block));
     }
 }
