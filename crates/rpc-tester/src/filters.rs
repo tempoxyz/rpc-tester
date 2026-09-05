@@ -30,7 +30,10 @@ pub const NEW_BLOCK_WAIT: Duration = Duration::from_secs(15);
 pub const FUTURE_TO_BLOCK_OFFSET: u64 = 1_000_000;
 
 /// Number of polls of a pending transaction filter after the first one.
-const PENDING_POLLS: usize = 5;
+///
+/// Together with [`PENDING_POLL_INTERVAL`] this spans more than a mainnet slot, so on a live chain
+/// the polls usually straddle a new block, which is what the head gating diagnostic needs to see.
+const PENDING_POLLS: usize = 7;
 
 /// Spacing between the polls of a pending transaction filter.
 const PENDING_POLL_INTERVAL: Duration = Duration::from_secs(2);
