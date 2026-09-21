@@ -17,14 +17,14 @@ jobs:
     permissions: {contents: read, id-token: write}
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+        uses: tempoxyz/gh-actions/actions/secure-runner@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
         with:
           cache-on-failure: true
       # Installs anvil, used by the same-node self-test.
-      - uses: tempoxyz/gh-actions/actions/setup-foundry@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+      - uses: tempoxyz/gh-actions/actions/setup-foundry@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
       - run: cargo test --workspace --all-features --locked
