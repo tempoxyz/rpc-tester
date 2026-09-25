@@ -19,16 +19,16 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@d39baa2b43f5eba5d261c047521a4fbd56101129 # 2026-09-23T04-31-11Z-d39baa2b
+        uses: tempoxyz/gh-actions/actions/secure-runner@5840979a7c849cbe541c67431ec7315cd6396e3b # 2026-09-25T08-14-04Z-5840979a
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Set up Docker CLI
-        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@d39baa2b43f5eba5d261c047521a4fbd56101129 # 2026-09-23T04-31-11Z-d39baa2b
+        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@5840979a7c849cbe541c67431ec7315cd6396e3b # 2026-09-25T08-14-04Z-5840979a
 
       - name: Login to GHCR
-        uses: tempoxyz/gh-actions/vendor/docker/login-action@d39baa2b43f5eba5d261c047521a4fbd56101129 # 2026-09-23T04-31-11Z-d39baa2b
+        uses: tempoxyz/gh-actions/vendor/docker/login-action@5840979a7c849cbe541c67431ec7315cd6396e3b # 2026-09-25T08-14-04Z-5840979a
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -39,7 +39,7 @@ jobs:
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push tagged
-        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@d39baa2b43f5eba5d261c047521a4fbd56101129 # 2026-09-23T04-31-11Z-d39baa2b
+        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@5840979a7c849cbe541c67431ec7315cd6396e3b # 2026-09-25T08-14-04Z-5840979a
         if: startsWith(github.ref, 'refs/tags/')
         with:
           context: .
@@ -54,7 +54,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build and push commit
-        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@d39baa2b43f5eba5d261c047521a4fbd56101129 # 2026-09-23T04-31-11Z-d39baa2b
+        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@5840979a7c849cbe541c67431ec7315cd6396e3b # 2026-09-25T08-14-04Z-5840979a
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           context: .
