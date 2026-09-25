@@ -28,14 +28,14 @@ type MethodName = String;
 /// Provider macro that boxes all method future results.
 #[macro_export]
 macro_rules! rpc {
-    ($self:expr, $method:ident $(, $args:expr )* ) => {{
-        let args: Vec<String> = vec![$(format!("{:?}", $args)),*];
+    ($self:expr, $method:ident $(, $args:expr )* $(; $option:ident($value:expr))? ) => {{
+        let args: Vec<String> = vec![$(format!("{:?}", $args),)* $(format!("{:?}", $value))?];
         let args_str = (!args.is_empty()).then(|| args.join(", "));
         Box::pin($self.test_rpc_call(
             stringify!($method),
             args_str,
             move |provider: &P| {
-                provider.$method( $( $args.clone(), )*)
+                provider.$method( $( $args.clone(), )*)$(.$option($value))?.into_future()
             }
         )) as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>
     }};

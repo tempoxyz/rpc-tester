@@ -75,7 +75,7 @@ impl Rng {
         Self((u64::from(nanos) << 32 | secs & 0xffff_ffff) | 1)
     }
 
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
@@ -85,7 +85,7 @@ impl Rng {
     }
 
     /// Returns a value in `[min, max]`. The modulo bias is irrelevant at these range sizes.
-    fn sample_range(&mut self, min: u64, max: u64) -> u64 {
+    const fn sample_range(&mut self, min: u64, max: u64) -> u64 {
         min + self.next() % (max - min + 1)
     }
 }

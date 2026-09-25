@@ -135,14 +135,14 @@ where
                 rpc!(
                     self,
                     get_block_by_hash,
-                    block_hash,
-                    alloy_rpc_types::BlockTransactionsKind::Full
+                    block_hash;
+                    kind(alloy_rpc_types::BlockTransactionsKind::Full)
                 ),
                 rpc!(
                     self,
                     get_block_by_number,
-                    block_tag,
-                    alloy_rpc_types::BlockTransactionsKind::Full
+                    block_tag;
+                    kind(alloy_rpc_types::BlockTransactionsKind::Full)
                 ),
                 rpc!(self, get_block_transaction_count_by_hash, block_hash),
                 rpc!(self, get_block_transaction_count_by_number, block_tag),
@@ -158,7 +158,7 @@ where
                 rpc_raw!(self, reth_getBalanceChangesInBlock, BalanceChanges, (block_id,)),
                 rpc_raw!(self, eth_getBalance, U256, canonical_args),
                 rpc!(self, trace_block, block_id),
-                rpc!(self, trace_replay_block_transactions, block_id, &[TraceType::StateDiff][..]),
+                rpc!(self, trace_replay_block_transactions, block_id; trace_types([TraceType::StateDiff])),
                 rpc!(self, debug_trace_block_by_hash, block_hash, call_tracer_opts()),
                 rpc!(self, debug_trace_block_by_number, block_tag, call_tracer_opts()),
                 rpc!(self, debug_trace_block_by_number, block_tag, prestate_tracer_opts()),
@@ -189,7 +189,7 @@ where
                     seen_tx_types.push(tx_type);
                 }
 
-                let (tx_hash, tx_from) = (tx.tx_hash(), tx.from);
+                let (tx_hash, tx_from) = (tx.tx_hash(), tx.from());
 
                 // Replaying the transaction as a call at the parent block exercises EVM execution
                 // on historical state, which no data-retrieval method touches. Both nodes get the
@@ -369,8 +369,8 @@ where
 
         #[rustfmt::skip]
         let tests = vec![
-            rpc!(self, get_block_by_hash, missing_hash, alloy_rpc_types::BlockTransactionsKind::Full),
-            rpc!(self, get_block_by_number, future_tag, alloy_rpc_types::BlockTransactionsKind::Full),
+            rpc!(self, get_block_by_hash, missing_hash; kind(alloy_rpc_types::BlockTransactionsKind::Full)),
+            rpc!(self, get_block_by_number, future_tag; kind(alloy_rpc_types::BlockTransactionsKind::Full)),
             rpc!(self, get_block_transaction_count_by_number, future_tag),
             rpc!(self, get_block_receipts, BlockId::Number(future_tag)),
             rpc!(self, get_transaction_by_hash, missing_hash),
@@ -392,7 +392,7 @@ where
     async fn test_tags(&self) -> Result<(), eyre::Error> {
         #[rustfmt::skip]
         let mut tests = vec![
-            rpc!(self, get_block_by_number, BlockNumberOrTag::Earliest, alloy_rpc_types::BlockTransactionsKind::Full),
+            rpc!(self, get_block_by_number, BlockNumberOrTag::Earliest; kind(alloy_rpc_types::BlockTransactionsKind::Full)),
             rpc!(self, get_block_transaction_count_by_number, BlockNumberOrTag::Earliest),
             rpc!(self, get_block_receipts, BlockId::Number(BlockNumberOrTag::Earliest)),
             rpc!(self, get_uncle_count, BlockId::Number(BlockNumberOrTag::Earliest)),
@@ -401,7 +401,7 @@ where
         if self.use_finality_tags {
             for tag in [BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized] {
                 #[rustfmt::skip]
-                tests.push(rpc!(self, get_block_by_number, tag, alloy_rpc_types::BlockTransactionsKind::Hashes));
+                tests.push(rpc!(self, get_block_by_number, tag; kind(alloy_rpc_types::BlockTransactionsKind::Hashes)));
             }
         }
 
@@ -451,7 +451,8 @@ where
 
             let block = self
                 .rpc2
-                .get_block_by_number(block_number.into(), true.into())
+                .get_block_by_number(block_number.into())
+                .full()
                 .await?
                 .ok_or_else(|| eyre::eyre!("block {block_number} not found on rpc2"))?;
             eyre::ensure!(
@@ -463,7 +464,7 @@ where
 
             let rpc1_hash = self
                 .rpc1
-                .get_block_by_number(block_number.into(), false.into())
+                .get_block_by_number(block_number.into())
                 .await?
                 .map(|block| block.header.hash);
             if rpc1_hash == Some(block_hash) {

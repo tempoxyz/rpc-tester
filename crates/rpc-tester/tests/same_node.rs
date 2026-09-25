@@ -29,7 +29,7 @@ fn provider(anvil: &AnvilInstance) -> impl Provider<AnyNetwork> + Clone {
     ProviderBuilder::new()
         .disable_recommended_fillers()
         .network::<AnyNetwork>()
-        .on_http(anvil.endpoint_url())
+        .connect_http(anvil.endpoint_url())
 }
 
 /// Sends a transaction from an unlocked dev account and waits until it is mined.

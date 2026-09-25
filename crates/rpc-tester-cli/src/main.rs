@@ -76,11 +76,11 @@ async fn main() -> eyre::Result<()> {
     let rpc1 = ProviderBuilder::new()
         .disable_recommended_fillers()
         .network::<AnyNetwork>()
-        .on_http(args.rpc1);
+        .connect_http(args.rpc1);
     let rpc2 = ProviderBuilder::new()
         .disable_recommended_fillers()
         .network::<AnyNetwork>()
-        .on_http(args.rpc2);
+        .connect_http(args.rpc2);
 
     let block_range =
         wait_for_readiness(&rpc1, &rpc2, args.num_blocks, Duration::from_secs(args.timeout))

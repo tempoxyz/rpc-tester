@@ -1,4 +1,4 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1.86.0 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.94.1 AS chef
 WORKDIR /app
 
 LABEL org.opencontainers.image.source=https://github.com/tempoxyz/rpc-tester
@@ -15,7 +15,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
 
 # Builds dependencies
-RUN cargo chef cook --recipe-path recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json
 
 # Copy source
 COPY . .

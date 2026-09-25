@@ -3,6 +3,7 @@
 name = "rpc-tester"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 [lints]
 workspace = true
@@ -12,8 +13,8 @@ alloy-primitives.workspace = true
 alloy-rpc-types.workspace = true
 alloy-rpc-types-trace.workspace = true
 alloy-provider = { workspace = true, features = ["trace-api", "debug-api"] }
-alloy-json-rpc = "0.11.1"
-alloy-transport = "0.11.1"
+alloy-json-rpc = "2.5.0"
+alloy-transport = "2.5.0"
 
 assert-json-diff.workspace = true
 eyre.workspace = true
