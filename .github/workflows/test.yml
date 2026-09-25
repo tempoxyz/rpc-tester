@@ -46,3 +46,9 @@ jobs:
           context: .
           platforms: linux/amd64
           push: false
+          load: true
+          tags: rpc-tester:pr-check
+      - name: Smoke test runtime binaries
+        run: |
+          docker run --rm rpc-tester:pr-check --help
+          docker run --rm --entrypoint nu rpc-tester:pr-check --version
