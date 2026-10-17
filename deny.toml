@@ -12,6 +12,5 @@ wildcards = "allow" # workspace path deps have no version
 
 [sources]
 unknown-registry = "deny"
-unknown-git = "deny"
+unknown-git = "allow"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
