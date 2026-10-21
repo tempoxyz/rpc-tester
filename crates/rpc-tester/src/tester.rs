@@ -12,7 +12,7 @@ use alloy_rpc_types::{AccessListResult, BlockId, BlockNumberOrTag, Filter};
 use alloy_rpc_types_trace::{
     filter::TraceFilter,
     geth::{GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions},
-    parity::TraceType,
+    parity::{LocalizedTransactionTrace, TraceType},
 };
 use alloy_transport::TransportError;
 use eyre::Result;
@@ -377,7 +377,8 @@ where
             rpc!(self, get_raw_transaction_by_hash, missing_hash),
             rpc!(self, get_transaction_receipt, missing_hash),
             rpc!(self, get_transaction_by_block_number_and_index, head_tag, 100_000usize),
-            rpc!(self, trace_transaction, missing_hash),
+            // Missing transactions may return null; Alloy's typed helper requires an array.
+            rpc_raw!(self, trace_transaction, Option<Vec<LocalizedTransactionTrace>>, (missing_hash,)),
             rpc!(self, debug_trace_transaction, missing_hash, call_tracer_opts()),
         ];
 
@@ -768,7 +769,8 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
 mod tests {
     use super::*;
     use alloy_json_rpc::ErrorPayload;
-    use alloy_transport::TransportErrorKind;
+    use alloy_provider::{ProviderBuilder, RootProvider};
+    use alloy_transport::{mock::Asserter, TransportErrorKind};
     use serde_json::json;
 
     fn error_resp(code: i64, message: &str) -> TransportError {
@@ -854,5 +856,61 @@ mod tests {
 
         rpc2["gasUsed"] = json!("0x1235");
         assert_ne!(rpc1, rpc2);
+    }
+
+    #[tokio::test]
+    async fn matching_missing_transaction_traces_agree() {
+        assert!(compare_trace_responses(json!(null), json!(null)).await.is_ok());
+        assert!(compare_trace_responses(json!([]), json!([])).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn null_and_empty_transaction_traces_diverge() {
+        let result = compare_trace_responses(json!(null), json!([])).await;
+        let Err(TestError::Diff { rpc1, rpc2, .. }) = result else {
+            panic!("null and an empty trace array must differ");
+        };
+        assert_eq!(rpc1, json!(null));
+        assert_eq!(rpc2, json!([]));
+    }
+
+    #[tokio::test]
+    async fn malformed_transaction_traces_do_not_agree() {
+        for response in [json!({}), json!([{}])] {
+            let result = compare_trace_responses(response.clone(), response).await;
+            assert!(matches!(result, Err(TestError::ErrDiff { .. })));
+        }
+    }
+
+    async fn compare_trace_responses(rpc1: JsonValue, rpc2: JsonValue) -> Result<(), TestError> {
+        let responses1 = Asserter::new();
+        responses1.push_success(&rpc1);
+        let responses2 = Asserter::new();
+        responses2.push_success(&rpc2);
+        let tester = RpcTester::builder(
+            ProviderBuilder::new()
+                .network::<AnyNetwork>()
+                .connect_mocked_client(responses1)
+                .root()
+                .clone(),
+            ProviderBuilder::new()
+                .network::<AnyNetwork>()
+                .connect_mocked_client(responses2)
+                .root()
+                .clone(),
+        )
+        .with_tracing(true)
+        .build();
+
+        // The raw-request macro needs the concrete provider type in scope.
+        type P = RootProvider<AnyNetwork>;
+        rpc_raw!(
+            tester,
+            trace_transaction,
+            Option<Vec<LocalizedTransactionTrace>>,
+            (B256::repeat_byte(0xff),)
+        )
+        .await
+        .1
     }
 }

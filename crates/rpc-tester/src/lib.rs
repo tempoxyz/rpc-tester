@@ -79,7 +79,7 @@ macro_rules! get_logs {
 /// Macro to create raw request and box the future result.
 #[macro_export]
 macro_rules! rpc_raw {
-    ($self:expr, $method:ident, $ret:ident $(, $args:expr )* ) => {{
+    ($self:expr, $method:ident, $ret:ty $(, $args:expr )* ) => {{
         let args_str = Some(format!("{}", [$(format!("{:?}", $args)),*].join(", ")));
         Box::pin($self.test_rpc_call(
             stringify!($method),
