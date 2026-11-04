@@ -640,11 +640,18 @@ fn errors_match(e1: &TransportError, e2: &TransportError) -> bool {
         (Some(r1), Some(r2)) => {
             r1.code == r2.code &&
                 r1.message == r2.message &&
-                r1.data.as_ref().map(|data| data.get()) ==
-                    r2.data.as_ref().map(|data| data.get())
+                error_data(r1.data.as_deref()) == error_data(r2.data.as_deref())
         }
         _ => false,
     }
+}
+
+/// Returns an error response's data, treating empty revert data (`"0x"`) as absent.
+///
+/// Clients differ on how they encode a revert without output: some omit `data`, others (geth,
+/// reth since paradigmxyz/reth#28243) return `"0x"`. Both mean the same revert.
+fn error_data(data: Option<&serde_json::value::RawValue>) -> Option<&str> {
+    data.map(|data| data.get()).filter(|data| *data != "\"0x\"")
 }
 
 /// Returns tracing options for the geth `callTracer`.
@@ -820,6 +827,18 @@ mod tests {
         assert!(errors_match(
             &error_resp_with_data(3, "execution reverted", "\"0xdead\""),
             &error_resp_with_data(3, "execution reverted", "\"0xdead\"")
+        ));
+    }
+
+    #[test]
+    fn empty_revert_data_matches_missing_data() {
+        assert!(errors_match(
+            &error_resp_with_data(3, "execution reverted", "\"0x\""),
+            &error_resp(3, "execution reverted")
+        ));
+        assert!(errors_match(
+            &error_resp(3, "execution reverted"),
+            &error_resp_with_data(3, "execution reverted", "\"0x\"")
         ));
     }
 
