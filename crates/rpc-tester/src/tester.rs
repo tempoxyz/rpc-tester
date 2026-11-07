@@ -60,6 +60,8 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Whether to compare `debug_executionWitness` for the newest tested block. Witness
     /// generation re-executes the block, so this is opt-in.
     use_execution_witness: bool,
+    /// Whether to query Tempo's `tempo` namespace.
+    use_tempo: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -200,11 +202,17 @@ where
                     (call_request_json(&tx_json), BlockId::number(block_number.saturating_sub(1)));
                 let estimate_args = call_args.clone();
                 let access_list_args = call_args.clone();
+                // Tempo's simulation adds the metadata of every TIP-20 token in the logs.
+                let tempo_simulate_args = (
+                    serde_json::json!({ "blockStateCalls": [{ "calls": [call_args.0.clone()] }] }),
+                    call_args.1,
+                );
                 #[rustfmt::skip]
                 let exec_calls = vec![
                     rpc_raw!(self, eth_call, Bytes, call_args),
                     rpc_raw!(self, eth_estimateGas, U256, estimate_args),
                     rpc_raw!(self, eth_createAccessList, AccessListResult, access_list_args),
+                    rpc_raw!(self, tempo_simulateV1, JsonValue, tempo_simulate_args),
                 ];
                 tests.extend(exec_calls);
 
@@ -397,6 +405,7 @@ where
             rpc!(self, get_block_transaction_count_by_number, BlockNumberOrTag::Earliest),
             rpc!(self, get_block_receipts, BlockId::Number(BlockNumberOrTag::Earliest)),
             rpc!(self, get_uncle_count, BlockId::Number(BlockNumberOrTag::Earliest)),
+            rpc_raw!(self, tempo_forkSchedule, JsonValue, ()),
         ];
 
         if self.use_finality_tags {
@@ -529,6 +538,7 @@ where
             !self.use_execution_witness
         } else {
             name.starts_with("reth") && !self.use_reth ||
+                name.starts_with("tempo") && !self.use_tempo ||
                 (name.contains("trace") || name.starts_with("debug")) && !self.use_tracing
         };
         if skip {
@@ -611,7 +621,7 @@ fn normalize_access_list_result(value: &mut JsonValue) {
 }
 
 /// Builds an `eth_call` request object from a transaction response's JSON, keeping a minimal
-/// subset of fields (`from`, `to`, `gas`, `value`, `input`).
+/// subset of fields (`from`, `to`, `gas`, `value`, `input`, and a Tempo transaction's `calls`).
 ///
 /// Access and authorization lists are dropped, so the call is not a faithful replay — but both
 /// nodes receive the identical request, so parity still holds. The gas price is pinned to zero
@@ -624,6 +634,25 @@ fn call_request_json(tx: &serde_json::Value) -> serde_json::Value {
         if let Some(value) = tx.get(key).filter(|value| !value.is_null()) {
             request.insert(key.to_string(), value.clone());
         }
+    }
+    // A Tempo transaction runs its calls instead of `to` and `input`.
+    if let Some(calls) = tx.get("calls").and_then(JsonValue::as_array).filter(|c| !c.is_empty()) {
+        let calls = calls
+            .iter()
+            .map(|call| {
+                let fields = ["to", "value", "input"].into_iter().filter_map(|key| {
+                    let value = call.get(key).filter(|value| !value.is_null())?;
+                    Some((key.to_string(), value.clone()))
+                });
+                JsonValue::Object(fields.collect())
+            })
+            .collect();
+        request.insert("calls".to_string(), JsonValue::Array(calls));
+        // Tempo transactions only take EIP-1559 fee fields.
+        for key in ["maxFeePerGas", "maxPriorityFeePerGas"] {
+            request.insert(key.to_string(), JsonValue::String("0x0".to_string()));
+        }
+        return JsonValue::Object(request);
     }
     request.insert("gasPrice".to_string(), serde_json::Value::String("0x0".to_string()));
     serde_json::Value::Object(request)
@@ -688,6 +717,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_finality_tags: bool,
     /// Whether to compare `debug_executionWitness` for the newest tested block.
     use_execution_witness: bool,
+    /// Whether to query Tempo's `tempo` namespace.
+    use_tempo: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -704,6 +735,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: false,
             use_finality_tags: false,
             use_execution_witness: false,
+            use_tempo: false,
             rate_limit_rps: None,
         }
     }
@@ -748,6 +780,12 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Enables or disables querying Tempo's `tempo` namespace.
+    pub const fn with_tempo(mut self, is_enabled: bool) -> Self {
+        self.use_tempo = is_enabled;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -766,6 +804,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: self.skip_extended_eth,
             use_finality_tags: self.use_finality_tags,
             use_execution_witness: self.use_execution_witness,
+            use_tempo: self.use_tempo,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
@@ -849,6 +888,27 @@ mod tests {
             &TransportErrorKind::backend_gone()
         ));
         assert!(!errors_match(&TransportErrorKind::backend_gone(), &error_resp(-32000, "a")));
+    }
+
+    #[test]
+    fn replays_tempo_calls() {
+        let tx = json!({
+            "type": "0x76",
+            "from": "0xaa",
+            "gas": "0x5208",
+            "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01", "data": null }],
+            "nonceKey": "0x1",
+        });
+        assert_eq!(
+            call_request_json(&tx),
+            json!({
+                "from": "0xaa",
+                "gas": "0x5208",
+                "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01" }],
+                "maxFeePerGas": "0x0",
+                "maxPriorityFeePerGas": "0x0",
+            })
+        );
     }
 
     #[test]

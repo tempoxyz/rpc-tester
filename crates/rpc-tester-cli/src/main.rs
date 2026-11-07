@@ -57,6 +57,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub use_execution_witness: bool,
 
+    /// Whether to query Tempo's `tempo` namespace.
+    #[arg(long)]
+    pub use_tempo: bool,
+
     /// Maximum time to wait for syncing in seconds
     #[arg(long, value_name = "TIMEOUT", default_value = "300")]
     pub timeout: u64,
@@ -93,6 +97,7 @@ async fn main() -> eyre::Result<()> {
         .skip_extended_eth(args.skip_extended_eth)
         .with_finality_tags(args.use_finality_tags)
         .with_execution_witness(args.use_execution_witness)
+        .with_tempo(args.use_tempo)
         .with_rate_limit(args.rate_limit)
         .build();
 
