@@ -11,7 +11,10 @@ use alloy_provider::{
 use alloy_rpc_types::{AccessListResult, BlockId, BlockNumberOrTag, Filter};
 use alloy_rpc_types_trace::{
     filter::TraceFilter,
-    geth::{GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions},
+    geth::{
+        CallConfig, FlatCallConfig, GethDebugBuiltInTracerType, GethDebugTracerType,
+        GethDebugTracingOptions, PreStateConfig,
+    },
     parity::{LocalizedTransactionTrace, TraceType},
 };
 use alloy_transport::TransportError;
@@ -161,6 +164,7 @@ where
                 rpc!(self, trace_replay_block_transactions, block_id; trace_types([TraceType::StateDiff])),
                 rpc!(self, debug_trace_block_by_hash, block_hash, call_tracer_opts()),
                 rpc!(self, debug_trace_block_by_number, block_tag, call_tracer_opts()),
+                rpc!(self, debug_trace_block_by_number, block_tag, call_tracer_with_log_opts()),
                 rpc!(self, debug_trace_block_by_number, block_tag, prestate_tracer_opts()),
                 get_logs!(self, &Filter::new().select(block_number)),
                 get_logs!(self, &Filter::new().at_block_hash(block_hash)),
@@ -196,17 +200,38 @@ where
                 // identical request, so results (or revert errors) must agree. Note that gas
                 // estimates and access lists are implementation-defined, so those two comparisons
                 // are meaningful primarily for same-client pairs.
-                let call_args =
+                let (request, parent) =
                     (call_request_json(&tx_json), BlockId::number(block_number.saturating_sub(1)));
+                let call_args = (request.clone(), parent);
                 let estimate_args = call_args.clone();
                 let access_list_args = call_args.clone();
+                // The traced replays cover the tracers on a call, which has no receipt to fill
+                // the root frame from.
+                let trace_call_args = (request.clone(), parent, call_tracer_with_log_opts());
+                let parity_call_args =
+                    (request.clone(), [TraceType::Trace, TraceType::StateDiff], parent);
                 #[rustfmt::skip]
                 let exec_calls = vec![
                     rpc_raw!(self, eth_call, Bytes, call_args),
                     rpc_raw!(self, eth_estimateGas, U256, estimate_args),
                     rpc_raw!(self, eth_createAccessList, AccessListResult, access_list_args),
+                    rpc_raw!(self, debug_traceCall, JsonValue, trace_call_args),
+                    rpc_raw!(self, trace_call, JsonValue, parity_call_args),
                 ];
                 tests.extend(exec_calls);
+
+                if !self.skip_extended_eth {
+                    // Simulation builds a block around the call, with receipts, logs and
+                    // synthetic transfer logs that `eth_call` does not return.
+                    let simulate_args = (
+                        serde_json::json!({
+                            "blockStateCalls": [{ "calls": [request] }],
+                            "traceTransfers": true,
+                        }),
+                        parent,
+                    );
+                    tests.push(rpc_raw!(self, eth_simulateV1, JsonValue, simulate_args));
+                }
 
                 if let Some(receipt) = self.rpc2.get_transaction_receipt(tx_hash).await? {
                     if let Some(log) = receipt.inner.inner.logs().first().map(|l| l.address()) {
@@ -283,7 +308,12 @@ where
                     rpc_with_block!(self, get_code_at, tx_from; block_id),
                     rpc!(self, trace_transaction, tx_hash),
                     rpc!(self, debug_trace_transaction, tx_hash, call_tracer_opts()),
+                    rpc!(self, debug_trace_transaction, tx_hash, call_tracer_with_log_opts()),
                     rpc!(self, debug_trace_transaction, tx_hash, prestate_tracer_opts()),
+                    rpc!(self, debug_trace_transaction, tx_hash, prestate_diff_tracer_opts()),
+                    rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_opts()),
+                    rpc!(self, debug_trace_transaction, tx_hash, four_byte_tracer_opts()),
+                    rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::Trace, TraceType::StateDiff])),
                 ];
                 tests.extend(tx_calls);
 
@@ -666,6 +696,35 @@ fn call_tracer_opts() -> GethDebugTracingOptions {
 fn prestate_tracer_opts() -> GethDebugTracingOptions {
     GethDebugTracingOptions::default()
         .with_tracer(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::PreStateTracer))
+}
+
+/// Returns tracing options for the geth `callTracer` with logs.
+///
+/// Logs are attached to their frames and carry log indices, a separate code path from the plain
+/// call tracer.
+fn call_tracer_with_log_opts() -> GethDebugTracingOptions {
+    GethDebugTracingOptions::call_tracer(CallConfig::default().with_log())
+}
+
+/// Returns tracing options for the geth `prestateTracer` in diff mode, which reports the
+/// post-state of every changed account.
+fn prestate_diff_tracer_opts() -> GethDebugTracingOptions {
+    GethDebugTracingOptions::prestate_tracer(PreStateConfig {
+        diff_mode: Some(true),
+        ..Default::default()
+    })
+}
+
+/// Returns tracing options for the geth `flatCallTracer`, which leaves out precompile calls and
+/// labels errors like Parity traces.
+fn flat_call_tracer_opts() -> GethDebugTracingOptions {
+    GethDebugTracingOptions::flat_call_tracer(FlatCallConfig::default())
+}
+
+/// Returns tracing options for the geth `4byteTracer`.
+fn four_byte_tracer_opts() -> GethDebugTracingOptions {
+    GethDebugTracingOptions::default()
+        .with_tracer(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::FourByteTracer))
 }
 
 /// Builder for [`RpcTester`].
