@@ -312,6 +312,7 @@ where
                     rpc!(self, debug_trace_transaction, tx_hash, prestate_tracer_opts()),
                     rpc!(self, debug_trace_transaction, tx_hash, prestate_diff_tracer_opts()),
                     rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_opts()),
+                    rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_with_precompiles_opts()),
                     rpc!(self, debug_trace_transaction, tx_hash, four_byte_tracer_opts()),
                     rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::Trace, TraceType::StateDiff])),
                 ];
@@ -715,10 +716,19 @@ fn prestate_diff_tracer_opts() -> GethDebugTracingOptions {
     })
 }
 
-/// Returns tracing options for the geth `flatCallTracer`, which leaves out precompile calls and
-/// labels errors like Parity traces.
+/// Returns tracing options for the geth `flatCallTracer` with its defaults, which leave out
+/// precompile calls, so a node that counts a contract as a precompile drops its frames.
 fn flat_call_tracer_opts() -> GethDebugTracingOptions {
     GethDebugTracingOptions::flat_call_tracer(FlatCallConfig::default())
+}
+
+/// Returns tracing options for the geth `flatCallTracer` that keep precompile calls and use
+/// Parity's error labels, so missing precompile frames and error conversion are compared.
+fn flat_call_tracer_with_precompiles_opts() -> GethDebugTracingOptions {
+    GethDebugTracingOptions::flat_call_tracer(FlatCallConfig {
+        include_precompiles: Some(true),
+        convert_parity_errors: Some(true),
+    })
 }
 
 /// Returns tracing options for the geth `4byteTracer`.
