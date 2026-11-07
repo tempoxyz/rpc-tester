@@ -175,20 +175,21 @@ where
             tests.extend(block_calls);
 
             // // Transaction/Receipt based RPCs
-            let mut seen_tx_types = Vec::new();
+            let mut seen_sample_keys = Vec::new();
             for (index, tx) in block.transactions.txns().enumerate() {
                 let tx_json = serde_json::to_value(tx).expect("should json");
 
                 // Without --use-all-txes, sample the first transaction of each distinct type
                 // instead of just the first of the block: the first transaction is often the same
                 // kind of searcher activity, while rarer types (blob, 7702, legacy) exercise
-                // different serialization and execution paths.
+                // different serialization and execution paths. Tempo transactions are further
+                // split by the features that take their own paths, see `sample_key`.
                 if !self.use_all_txes {
-                    let tx_type = tx_json.get("type").cloned();
-                    if seen_tx_types.contains(&tx_type) {
+                    let key = sample_key(&tx_json);
+                    if seen_sample_keys.contains(&key) {
                         continue;
                     }
-                    seen_tx_types.push(tx_type);
+                    seen_sample_keys.push(key);
                 }
 
                 let (tx_hash, tx_from) = (tx.tx_hash(), tx.from());
@@ -215,6 +216,36 @@ where
                     rpc_raw!(self, tempo_simulateV1, JsonValue, tempo_simulate_args),
                 ];
                 tests.extend(exec_calls);
+
+                if self.use_tempo {
+                    // Fee-free replays skip fee collection, where Tempo resolves, charges and
+                    // refunds a TIP-20 fee token and emits logs outside any call frame.
+                    let fee_call_args = (
+                        fee_call_request_json(&tx_json),
+                        BlockId::number(block_number.saturating_sub(1)),
+                    );
+                    let fee_estimate_args = fee_call_args.clone();
+                    let fee_prestate_args = (
+                        fee_call_args.0.clone(),
+                        fee_call_args.1,
+                        serde_json::json!({ "tracer": "prestateTracer", "tracerConfig": { "diffMode": true } }),
+                    );
+                    let fee_simulate_args = (
+                        serde_json::json!({
+                            "blockStateCalls": [{ "calls": [fee_call_args.0.clone()] }],
+                            "traceTransfers": true,
+                        }),
+                        fee_call_args.1,
+                    );
+                    #[rustfmt::skip]
+                    let fee_calls = vec![
+                        rpc_raw!(self, eth_call, Bytes, fee_call_args),
+                        rpc_raw!(self, eth_estimateGas, U256, fee_estimate_args),
+                        rpc_raw!(self, debug_traceCall, JsonValue, fee_prestate_args),
+                        rpc_raw!(self, tempo_simulateV1, JsonValue, fee_simulate_args),
+                    ];
+                    tests.extend(fee_calls);
+                }
 
                 if let Some(receipt) = self.rpc2.get_transaction_receipt(tx_hash).await? {
                     if let Some(log) = receipt.inner.inner.logs().first().map(|l| l.address()) {
@@ -658,6 +689,60 @@ fn call_request_json(tx: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(request)
 }
 
+/// Builds a call request that pays the transaction's own fees, unlike [`call_request_json`], and
+/// carries a Tempo transaction's fee token, nonce key, validity window and authorizations.
+///
+/// A sponsored transaction is replayed with its sender paying, since a fee payer signature does
+/// not cover the request.
+fn fee_call_request_json(tx: &JsonValue) -> JsonValue {
+    let mut request = call_request_json(tx);
+    let request_fields = request.as_object_mut().expect("call request is an object");
+    for key in ["gasPrice", "maxFeePerGas", "maxPriorityFeePerGas"] {
+        request_fields.remove(key);
+    }
+    // Responses report the effective `gasPrice` of EIP-1559 transactions too, and a request may
+    // not carry both kinds of fee fields.
+    let fee_fields: &[&str] = if tx.get("maxFeePerGas").is_some_and(|fee| !fee.is_null()) {
+        &["maxFeePerGas", "maxPriorityFeePerGas"]
+    } else {
+        &["gasPrice"]
+    };
+    let tempo_fields =
+        ["feeToken", "nonce", "nonceKey", "validBefore", "validAfter", "keyAuthorization"];
+    let list_fields = ["accessList", "authorizationList", "aaAuthorizationList"];
+    for key in fee_fields.iter().chain(&tempo_fields).chain(&list_fields) {
+        let Some(value) = tx.get(*key).filter(|value| !value.is_null()) else { continue };
+        if value.as_array().is_some_and(Vec::is_empty) {
+            continue;
+        }
+        request_fields.insert((*key).to_string(), value.clone());
+    }
+    request
+}
+
+/// Returns the key that groups transactions for sampling: the type, and for a Tempo transaction
+/// also whether it batches calls, its nonce kind, sponsorship, key authorization and signature
+/// type, which each take their own execution or tracing path.
+fn sample_key(tx: &JsonValue) -> JsonValue {
+    let tx_type = tx.get("type").cloned().unwrap_or_default();
+    let Some(calls) = tx.get("calls").and_then(JsonValue::as_array) else { return tx_type };
+    let is_set = |key: &str| tx.get(key).is_some_and(|value| !value.is_null());
+    let nonce = match tx.get("nonceKey").and_then(JsonValue::as_str) {
+        None | Some("0x0") => "protocol",
+        // An expiring nonce uses the maximum nonce key.
+        Some(key) if key.len() == 66 && key[2..].bytes().all(|byte| byte == b'f') => "expiring",
+        Some(_) => "2d",
+    };
+    serde_json::json!([
+        tx_type,
+        calls.len() > 1,
+        nonce,
+        is_set("feePayerSignature"),
+        is_set("keyAuthorization"),
+        tx.pointer("/signature/type"),
+    ])
+}
+
 /// Returns whether two RPC errors are the same error response.
 ///
 /// Only JSON-RPC error responses are compared (by code and message); transport-level failures
@@ -888,6 +973,62 @@ mod tests {
             &TransportErrorKind::backend_gone()
         ));
         assert!(!errors_match(&TransportErrorKind::backend_gone(), &error_resp(-32000, "a")));
+    }
+
+    #[test]
+    fn fee_replay_pays_the_transaction_fees() {
+        let tx = json!({
+            "type": "0x76",
+            "from": "0xaa",
+            "gas": "0x5208",
+            "gasPrice": "0x5",
+            "maxFeePerGas": "0x9",
+            "maxPriorityFeePerGas": "0x1",
+            "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01" }],
+            "feeToken": "0xcc",
+            "nonce": "0x2",
+            "nonceKey": "0x1",
+            "validBefore": null,
+            "feePayerSignature": { "r": "0x1" },
+            "aaAuthorizationList": [],
+        });
+        assert_eq!(
+            fee_call_request_json(&tx),
+            json!({
+                "from": "0xaa",
+                "gas": "0x5208",
+                "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01" }],
+                "maxFeePerGas": "0x9",
+                "maxPriorityFeePerGas": "0x1",
+                "feeToken": "0xcc",
+                "nonce": "0x2",
+                "nonceKey": "0x1",
+            })
+        );
+
+        let legacy = json!({ "type": "0x0", "from": "0xaa", "to": "0xbb", "gasPrice": "0x5" });
+        assert_eq!(
+            fee_call_request_json(&legacy),
+            json!({ "from": "0xaa", "to": "0xbb", "gasPrice": "0x5" })
+        );
+    }
+
+    #[test]
+    fn samples_tempo_transactions_by_feature() {
+        let tx = |calls: usize, nonce_key: &str| {
+            json!({
+                "type": "0x76",
+                "calls": vec![json!({}); calls],
+                "nonceKey": nonce_key,
+                "signature": { "type": "secp256k1" },
+            })
+        };
+        let single = sample_key(&tx(1, "0x0"));
+        assert_ne!(single, sample_key(&tx(2, "0x0")));
+        assert_ne!(single, sample_key(&tx(1, "0x5")));
+        assert_ne!(sample_key(&tx(1, "0x5")), sample_key(&tx(1, &format!("0x{}", "f".repeat(64)))));
+        assert_eq!(single, sample_key(&tx(1, "0x0")));
+        assert_eq!(sample_key(&json!({ "type": "0x2", "to": "0xbb" })), json!("0x2"));
     }
 
     #[test]
