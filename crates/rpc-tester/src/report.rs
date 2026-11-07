@@ -4,10 +4,14 @@ use super::{ReportResults, TestError};
 use assert_json_diff::assert_json_include;
 use serde_json::Value;
 
-/// Fields that are client-specific extensions and should be ignored during comparison.
+/// Fields that are client-specific extensions of receipts and should be ignored during comparison.
 /// For example, Nethermind includes an "error" field on reverted transaction receipts
 /// which is not part of the Ethereum JSON-RPC specification.
 const IGNORED_FIELDS: &[&str] = &["error"];
+
+/// Methods returning receipts, the only results [`IGNORED_FIELDS`] are removed from. Elsewhere,
+/// such as in call traces, `error` is a call's failure and is compared.
+const RECEIPT_METHODS: &[&str] = &["get_transaction_receipt", "get_block_receipts"];
 
 /// Prints test results to console.
 ///
@@ -25,8 +29,11 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
                 Ok(_) => {}
                 Err(TestError::Diff { rpc1, rpc2, args }) => {
                     // Filter out client-specific extension fields before comparison
-                    let rpc1 = filter_ignored_fields(rpc1);
-                    let rpc2 = filter_ignored_fields(rpc2);
+                    let (rpc1, rpc2) = if RECEIPT_METHODS.contains(&name.as_str()) {
+                        (filter_ignored_fields(rpc1), filter_ignored_fields(rpc2))
+                    } else {
+                        (rpc1, rpc2)
+                    };
 
                     // While results are different, we only report it as error if __RPC1__ is
                     // missing/mismatching any element against RPC2.
@@ -153,13 +160,24 @@ mod tests {
             TestError::Diff { rpc1: json!({ "a": 1 }), rpc2: json!({ "a": 2 }), args: None };
         assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(mismatch))])]).is_err());
 
-        // Ignored client-specific extension fields do not fail.
-        let ignored = TestError::Diff {
+        // Client-specific receipt extension fields do not fail.
+        let receipt = || TestError::Diff {
             rpc1: json!({ "a": 1 }),
             rpc2: json!({ "a": 1, "error": "reverted" }),
             args: None,
         };
-        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(ignored))])]).is_ok());
+        let method = "get_transaction_receipt".to_string();
+        assert!(report(vec![("t".to_string(), vec![(method, Err(receipt()))])]).is_ok());
+
+        // Elsewhere, such as in a call trace, a missing or different `error` fails.
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(receipt()))])]).is_err());
+        let trace_error = TestError::Diff {
+            rpc1: json!({ "calls": [{ "error": "out of gas" }] }),
+            rpc2: json!({ "calls": [{ "error": "invalid opcode" }] }),
+            args: None,
+        };
+        let method = "debug_trace_transaction".to_string();
+        assert!(report(vec![("t".to_string(), vec![(method, Err(trace_error))])]).is_err());
 
         // Error mismatches and node errors always fail.
         let err_diff =
