@@ -13,7 +13,7 @@ use alloy_rpc_types_trace::{
     filter::TraceFilter,
     geth::{
         CallConfig, FlatCallConfig, GethDebugBuiltInTracerType, GethDebugTracerType,
-        GethDebugTracingOptions, PreStateConfig,
+        GethDebugTracingOptions, GethDefaultTracingOptions, PreStateConfig,
     },
     parity::{LocalizedTransactionTrace, TraceType},
 };
@@ -314,7 +314,12 @@ where
                     rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_opts()),
                     rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_with_precompiles_opts()),
                     rpc!(self, debug_trace_transaction, tx_hash, four_byte_tracer_opts()),
+                    rpc!(self, debug_trace_transaction, tx_hash, struct_log_opts()),
                     rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::Trace, TraceType::StateDiff])),
+                    // The VM trace records every executed opcode's cost, pushed values and memory
+                    // and storage writes. It is replayed on its own so that a node failing to build
+                    // it does not hide the trace and state diff comparison.
+                    rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::VmTrace])),
                 ];
                 tests.extend(tx_calls);
 
@@ -735,6 +740,15 @@ fn flat_call_tracer_with_precompiles_opts() -> GethDebugTracingOptions {
 fn four_byte_tracer_opts() -> GethDebugTracingOptions {
     GethDebugTracingOptions::default()
         .with_tracer(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::FourByteTracer))
+}
+
+/// Returns tracing options for the default struct logger without stack and storage, which
+/// compares every executed opcode's gas, cost, depth and refund while keeping responses small.
+fn struct_log_opts() -> GethDebugTracingOptions {
+    GethDebugTracingOptions {
+        config: GethDefaultTracingOptions::default().disable_stack().disable_storage(),
+        ..Default::default()
+    }
 }
 
 /// Builder for [`RpcTester`].
