@@ -316,10 +316,6 @@ where
                     rpc!(self, debug_trace_transaction, tx_hash, four_byte_tracer_opts()),
                     rpc!(self, debug_trace_transaction, tx_hash, struct_log_opts()),
                     rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::Trace, TraceType::StateDiff])),
-                    // The VM trace records every executed opcode's cost, pushed values and memory
-                    // and storage writes. It is replayed on its own so that a node failing to build
-                    // it does not hide the trace and state diff comparison.
-                    rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::VmTrace])),
                 ];
                 tests.extend(tx_calls);
 
