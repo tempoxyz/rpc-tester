@@ -63,6 +63,8 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Whether to compare `debug_executionWitness` for the newest tested block. Witness
     /// generation re-executes the block, so this is opt-in.
     use_execution_witness: bool,
+    /// Whether to query Otterscan's `ots` namespace, which only some clients serve.
+    use_ots: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -175,6 +177,13 @@ where
             ];
 
             tests.extend(block_calls);
+
+            #[rustfmt::skip]
+            let ots_block_calls = vec![
+                rpc_raw!(self, ots_getBlockDetails, JsonValue, (block_number,)),
+                rpc_raw!(self, ots_getBlockTransactions, JsonValue, (block_number, 0, 10)),
+            ];
+            tests.extend(ots_block_calls);
 
             // // Transaction/Receipt based RPCs
             let mut seen_tx_types = Vec::new();
@@ -317,6 +326,16 @@ where
                     rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::Trace, TraceType::StateDiff])),
                 ];
                 tests.extend(tx_calls);
+
+                // Otterscan builds its own call tree and internal operations from separate
+                // inspectors, which can diverge from the other tracers.
+                #[rustfmt::skip]
+                let ots_tx_calls = vec![
+                    rpc_raw!(self, ots_traceTransaction, JsonValue, (tx_hash,)),
+                    rpc_raw!(self, ots_getInternalOperations, JsonValue, (tx_hash,)),
+                    rpc_raw!(self, ots_getTransactionError, JsonValue, (tx_hash,)),
+                ];
+                tests.extend(ots_tx_calls);
 
                 if !self.skip_extended_eth {
                     #[rustfmt::skip]
@@ -555,9 +574,11 @@ where
         // The debug namespace is gated together with tracing: `debug_getRaw*` are typically
         // enabled alongside the trace methods, and running them against nodes without the
         // namespace would fail every block. `debug_executionWitness` has its own opt-in,
-        // independent of the tracing gate.
+        // independent of the tracing gate, and so does the `ots` namespace.
         let skip = if name == "debug_executionWitness" {
             !self.use_execution_witness
+        } else if name.starts_with("ots") {
+            !self.use_ots
         } else {
             name.starts_with("reth") && !self.use_reth ||
                 (name.contains("trace") || name.starts_with("debug")) && !self.use_tracing
@@ -757,6 +778,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_finality_tags: bool,
     /// Whether to compare `debug_executionWitness` for the newest tested block.
     use_execution_witness: bool,
+    /// Whether to query Otterscan's `ots` namespace.
+    use_ots: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -773,6 +796,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: false,
             use_finality_tags: false,
             use_execution_witness: false,
+            use_ots: false,
             rate_limit_rps: None,
         }
     }
@@ -817,6 +841,12 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Enables or disables Otterscan's `ots` namespace, which only some clients serve.
+    pub const fn with_ots(mut self, is_enabled: bool) -> Self {
+        self.use_ots = is_enabled;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -835,6 +865,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: self.skip_extended_eth,
             use_finality_tags: self.use_finality_tags,
             use_execution_witness: self.use_execution_witness,
+            use_ots: self.use_ots,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
