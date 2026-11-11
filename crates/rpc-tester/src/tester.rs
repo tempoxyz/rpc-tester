@@ -680,7 +680,8 @@ fn normalize_access_list_result(value: &mut JsonValue) {
 }
 
 /// Builds an `eth_call` request object from a transaction response's JSON, keeping a minimal
-/// subset of fields (`from`, `to`, `gas`, `value`, `input`, and a Tempo transaction's `calls`).
+/// subset of fields (`from`, `to`, `gas`, `value`, `input`, and a Tempo transaction's `calls`,
+/// nonce key and validity window).
 ///
 /// Access and authorization lists are dropped, so the call is not a faithful replay — but both
 /// nodes receive the identical request, so parity still holds. The gas price is pinned to zero
@@ -707,6 +708,14 @@ fn call_request_json(tx: &serde_json::Value) -> serde_json::Value {
             })
             .collect();
         request.insert("calls".to_string(), JsonValue::Array(calls));
+        // Without its nonce key, a transaction on an expiring or 2D nonce replays on the protocol
+        // nonce, which charges new-account gas while that nonce is zero. An expiring nonce also
+        // requires its validity window.
+        for key in ["nonceKey", "validBefore", "validAfter"] {
+            if let Some(value) = tx.get(key).filter(|value| !value.is_null()) {
+                request.insert(key.to_string(), value.clone());
+            }
+        }
         // Tempo transactions only take EIP-1559 fee fields.
         for key in ["maxFeePerGas", "maxPriorityFeePerGas"] {
             request.insert(key.to_string(), JsonValue::String("0x0".to_string()));
@@ -718,7 +727,7 @@ fn call_request_json(tx: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Builds a call request that pays the transaction's own fees, unlike [`call_request_json`], and
-/// carries a Tempo transaction's fee token, nonce key, validity window and authorizations.
+/// carries a Tempo transaction's fee token, nonce and authorizations.
 ///
 /// A sponsored transaction is replayed with its sender paying, since a fee payer signature does
 /// not cover the request.
@@ -735,8 +744,7 @@ fn fee_call_request_json(tx: &JsonValue) -> JsonValue {
     } else {
         &["gasPrice"]
     };
-    let tempo_fields =
-        ["feeToken", "nonce", "nonceKey", "validBefore", "validAfter", "keyAuthorization"];
+    let tempo_fields = ["feeToken", "nonce", "keyAuthorization"];
     let list_fields = ["accessList", "authorizationList", "aaAuthorizationList"];
     for key in fee_fields.iter().chain(&tempo_fields).chain(&list_fields) {
         let Some(value) = tx.get(*key).filter(|value| !value.is_null()) else { continue };
@@ -1105,6 +1113,8 @@ mod tests {
             "gas": "0x5208",
             "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01", "data": null }],
             "nonceKey": "0x1",
+            "validBefore": "0x64",
+            "validAfter": null,
         });
         assert_eq!(
             call_request_json(&tx),
@@ -1112,6 +1122,8 @@ mod tests {
                 "from": "0xaa",
                 "gas": "0x5208",
                 "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01" }],
+                "nonceKey": "0x1",
+                "validBefore": "0x64",
                 "maxFeePerGas": "0x0",
                 "maxPriorityFeePerGas": "0x0",
             })
