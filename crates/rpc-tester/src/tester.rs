@@ -759,8 +759,8 @@ fn fee_call_request_json(tx: &JsonValue) -> JsonValue {
 }
 
 /// Returns the key that groups transactions for sampling: the type, and for a Tempo transaction
-/// also whether it batches calls, its nonce kind, sponsorship, key authorization and signature
-/// type, which each take their own execution or tracing path.
+/// also whether it batches calls, whether it creates a contract, its nonce kind, sponsorship, key
+/// authorization and signature type, which each take their own execution or tracing path.
 fn sample_key(tx: &JsonValue) -> JsonValue {
     let tx_type = tx.get("type").cloned().unwrap_or_default();
     let Some(calls) = tx.get("calls").and_then(JsonValue::as_array) else { return tx_type };
@@ -774,6 +774,8 @@ fn sample_key(tx: &JsonValue) -> JsonValue {
     serde_json::json!([
         tx_type,
         calls.len() > 1,
+        // Only the first call may create a contract.
+        calls.first().is_some_and(|call| call.get("to").is_none_or(JsonValue::is_null)),
         nonce,
         is_set("feePayerSignature"),
         is_set("keyAuthorization"),
@@ -1094,7 +1096,7 @@ mod tests {
         let tx = |calls: usize, nonce_key: &str| {
             json!({
                 "type": "0x76",
-                "calls": vec![json!({}); calls],
+                "calls": vec![json!({ "to": "0xbb" }); calls],
                 "nonceKey": nonce_key,
                 "signature": { "type": "secp256k1" },
             })
@@ -1104,6 +1106,10 @@ mod tests {
         assert_ne!(single, sample_key(&tx(1, "0x5")));
         assert_ne!(sample_key(&tx(1, "0x5")), sample_key(&tx(1, &format!("0x{}", "f".repeat(64)))));
         assert_eq!(single, sample_key(&tx(1, "0x0")));
+
+        let mut create = tx(2, "0x0");
+        create["calls"][0]["to"] = JsonValue::Null;
+        assert_ne!(sample_key(&tx(2, "0x0")), sample_key(&create));
         assert_eq!(sample_key(&json!({ "type": "0x2", "to": "0xbb" })), json!("0x2"));
     }
 
