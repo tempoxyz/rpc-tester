@@ -850,34 +850,73 @@ fn error_data(data: Option<&serde_json::value::RawValue>) -> Option<&str> {
 /// Probes genesis first. A pruned reth node rejects it with an error naming the earliest
 /// available block, which is used directly; otherwise the lowest block the node returns is found
 /// by binary search, assuming pruning only removes a contiguous prefix of history.
+///
+/// Only a missing block or a pruned-history error counts as pruned. Any other error (a timeout,
+/// a rate limit, a node bug) is returned, so it fails the run instead of silently raising the
+/// floor. With `rate_limit_rps`, probes are spaced to stay within it.
 pub async fn earliest_available_block<P: Provider<AnyNetwork>>(
     provider: &P,
     head: BlockNumber,
+    rate_limit_rps: Option<u32>,
 ) -> Result<BlockNumber> {
-    match provider.get_block_by_number(BlockNumberOrTag::Number(0)).await {
-        Ok(Some(_)) => return Ok(0),
-        Err(err) => {
-            if let Some(block) =
-                err.as_error_resp().and_then(|resp| parse_earliest_available(&resp.message))
-            {
-                return Ok(block.min(head));
-            }
-            debug!(?err, "genesis unavailable, searching for the earliest available block");
+    let interval =
+        rate_limit_rps.map(|rps| std::time::Duration::from_secs_f64(1.0 / rps.max(1) as f64));
+    let probe = |block: BlockNumber| async move {
+        if let Some(interval) = interval {
+            tokio::time::sleep(interval).await;
         }
-        Ok(None) => {}
+        let response = provider.get_block_by_number(BlockNumberOrTag::Number(block)).await;
+        classify_probe(response.map(|block| block.is_some()))
+    };
+
+    match probe(0).await? {
+        Probe::Available => return Ok(0),
+        Probe::Pruned(Some(earliest)) => return Ok(earliest.min(head)),
+        Probe::Pruned(None) => {
+            debug!("genesis unavailable, searching for the earliest available block")
+        }
     }
 
     let (mut lo, mut hi) = (1, head);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let block = provider.get_block_by_number(BlockNumberOrTag::Number(mid)).await;
-        if matches!(block, Ok(Some(_))) {
-            hi = mid;
-        } else {
-            lo = mid + 1;
+        match probe(mid).await? {
+            Probe::Available => hi = mid,
+            Probe::Pruned(Some(earliest)) => return Ok(earliest.min(head)),
+            Probe::Pruned(None) => lo = mid + 1,
         }
     }
     Ok(lo)
+}
+
+/// Outcome of probing whether a node serves a block.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// The node returned the block.
+    Available,
+    /// The node pruned the block, with the earliest available block when its error names one.
+    Pruned(Option<BlockNumber>),
+}
+
+/// Reth's JSON-RPC error code for history that pruning removed.
+const PRUNED_HISTORY_ERROR_CODE: i64 = 4444;
+
+/// Classifies a block probe: a missing block or a pruned-history error is pruned, any other error
+/// is returned.
+fn classify_probe(response: Result<bool, TransportError>) -> Result<Probe> {
+    match response {
+        Ok(true) => Ok(Probe::Available),
+        Ok(false) => Ok(Probe::Pruned(None)),
+        Err(err) => {
+            if let Some(resp) = err.as_error_resp() {
+                let earliest = parse_earliest_available(&resp.message);
+                if resp.code == PRUNED_HISTORY_ERROR_CODE || earliest.is_some() {
+                    return Ok(Probe::Pruned(earliest));
+                }
+            }
+            Err(eyre::eyre!("probing for the earliest available block failed: {err}"))
+        }
+    }
 }
 
 /// Extracts `N` from an error message containing `earliest available N`, as reth's
@@ -1121,6 +1160,28 @@ mod tests {
         );
         assert_eq!(parse_earliest_available("header not found"), None);
         assert_eq!(parse_earliest_available("earliest available"), None);
+    }
+
+    #[test]
+    fn classifies_block_probes() {
+        assert_eq!(classify_probe(Ok(true)).unwrap(), Probe::Available);
+        assert_eq!(classify_probe(Ok(false)).unwrap(), Probe::Pruned(None));
+        assert_eq!(
+            classify_probe(Err(error_resp(
+                4444,
+                "pruned history unavailable: requested 1, earliest available 26350000"
+            )))
+            .unwrap(),
+            Probe::Pruned(Some(26_350_000))
+        );
+        assert_eq!(
+            classify_probe(Err(error_resp(4444, "pruned history unavailable"))).unwrap(),
+            Probe::Pruned(None)
+        );
+        // Rate limits, transport failures and other errors must not count as pruned.
+        assert!(classify_probe(Err(error_resp(429, "too many requests"))).is_err());
+        assert!(classify_probe(Err(error_resp(-32000, "internal error"))).is_err());
+        assert!(classify_probe(Err(TransportErrorKind::backend_gone())).is_err());
     }
 
     #[test]

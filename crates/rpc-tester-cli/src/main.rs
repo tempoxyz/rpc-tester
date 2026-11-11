@@ -96,9 +96,9 @@ async fn main() -> eyre::Result<()> {
     // A pruned node cannot serve history below its earliest block, so blocks either node pruned
     // are left out instead of failing as diffs.
     let head = *block_range.end();
-    let history_floor = earliest_available_block(&rpc1, head)
+    let history_floor = earliest_available_block(&rpc1, head, args.rate_limit)
         .await?
-        .max(earliest_available_block(&rpc2, head).await?);
+        .max(earliest_available_block(&rpc2, head, args.rate_limit).await?);
     if history_floor > 0 {
         info!(history_floor, "history below this block is pruned on at least one node");
     }
