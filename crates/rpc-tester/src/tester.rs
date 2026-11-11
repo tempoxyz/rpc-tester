@@ -230,8 +230,10 @@ where
                 tests.extend(exec_calls);
 
                 if self.use_tempo {
-                    // Fee-free replays skip fee collection, where Tempo resolves, charges and
-                    // refunds a TIP-20 fee token and emits logs outside any call frame.
+                    // Replays with the transaction's own fees, fee token and authorizations, which
+                    // the fee-free replays drop. Calls, estimates and traced calls still resolve
+                    // and validate the fee token but skip fee collection, so only the simulation
+                    // charges and refunds it, emitting logs outside any call frame.
                     let fee_call_args = (fee_call_request_json(&tx_json), parent);
                     let fee_estimate_args = fee_call_args.clone();
                     let fee_prestate_args = (
