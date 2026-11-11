@@ -63,6 +63,9 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Whether to compare `debug_executionWitness` for the newest tested block. Witness
     /// generation re-executes the block, so this is opt-in.
     use_execution_witness: bool,
+    /// Oldest block both nodes still serve. Anything below it was pruned on at least one node, so
+    /// the genesis-pinned `earliest` tag is only compared when this is zero.
+    history_floor: BlockNumber,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -419,23 +422,34 @@ where
 
     /// Verifies RPC calls addressed by block tag rather than number or hash.
     ///
-    /// `earliest` is compared unconditionally since it is pinned to genesis. `safe` and
+    /// `earliest` is pinned to genesis, so it is compared only when neither node pruned it (see
+    /// [`RpcTesterBuilder::with_history_floor`]). `safe` and
     /// `finalized` move with the chain and require both nodes to share a consensus view, so they
     /// are gated behind the finality tags option.
     async fn test_tags(&self) -> Result<(), eyre::Error> {
-        #[rustfmt::skip]
-        let mut tests = vec![
-            rpc!(self, get_block_by_number, BlockNumberOrTag::Earliest; kind(alloy_rpc_types::BlockTransactionsKind::Full)),
-            rpc!(self, get_block_transaction_count_by_number, BlockNumberOrTag::Earliest),
-            rpc!(self, get_block_receipts, BlockId::Number(BlockNumberOrTag::Earliest)),
-            rpc!(self, get_uncle_count, BlockId::Number(BlockNumberOrTag::Earliest)),
-        ];
+        let mut tests = Vec::new();
+
+        if self.history_floor == 0 {
+            #[rustfmt::skip]
+            tests.extend([
+                rpc!(self, get_block_by_number, BlockNumberOrTag::Earliest; kind(alloy_rpc_types::BlockTransactionsKind::Full)),
+                rpc!(self, get_block_transaction_count_by_number, BlockNumberOrTag::Earliest),
+                rpc!(self, get_block_receipts, BlockId::Number(BlockNumberOrTag::Earliest)),
+                rpc!(self, get_uncle_count, BlockId::Number(BlockNumberOrTag::Earliest)),
+            ]);
+        } else {
+            info!(history_floor = self.history_floor, "skipping `earliest` tag, genesis is pruned");
+        }
 
         if self.use_finality_tags {
             for tag in [BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized] {
                 #[rustfmt::skip]
                 tests.push(rpc!(self, get_block_by_number, tag; kind(alloy_rpc_types::BlockTransactionsKind::Hashes)));
             }
+        }
+
+        if tests.is_empty() {
+            return Ok(());
         }
 
         report(vec![("Block tags".to_string(), futures::future::join_all(tests).await)])
@@ -686,6 +700,51 @@ fn error_data(data: Option<&serde_json::value::RawValue>) -> Option<&str> {
     data.map(|data| data.get()).filter(|data| *data != "\"0x\"")
 }
 
+/// Returns the oldest block `provider` still serves, at most `head`.
+///
+/// Probes genesis first. A pruned reth node rejects it with an error naming the earliest
+/// available block, which is used directly; otherwise the lowest block the node returns is found
+/// by binary search, assuming pruning only removes a contiguous prefix of history.
+pub async fn earliest_available_block<P: Provider<AnyNetwork>>(
+    provider: &P,
+    head: BlockNumber,
+) -> Result<BlockNumber> {
+    match provider.get_block_by_number(BlockNumberOrTag::Number(0)).await {
+        Ok(Some(_)) => return Ok(0),
+        Err(err) => {
+            if let Some(block) =
+                err.as_error_resp().and_then(|resp| parse_earliest_available(&resp.message))
+            {
+                return Ok(block.min(head));
+            }
+            debug!(?err, "genesis unavailable, searching for the earliest available block");
+        }
+        Ok(None) => {}
+    }
+
+    let (mut lo, mut hi) = (1, head);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let block = provider.get_block_by_number(BlockNumberOrTag::Number(mid)).await;
+        if matches!(block, Ok(Some(_))) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok(lo)
+}
+
+/// Extracts `N` from an error message containing `earliest available N`, as reth's
+/// pruned-history error (code 4444) does:
+/// `pruned history unavailable: requested 1, earliest available 26350000`.
+fn parse_earliest_available(message: &str) -> Option<BlockNumber> {
+    let (_, rest) = message.split_once("earliest available")?;
+    let digits: String =
+        rest.trim_start_matches([' ', ':']).chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Returns tracing options for the geth `callTracer`.
 fn call_tracer_opts() -> GethDebugTracingOptions {
     GethDebugTracingOptions::default()
@@ -767,6 +826,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_finality_tags: bool,
     /// Whether to compare `debug_executionWitness` for the newest tested block.
     use_execution_witness: bool,
+    /// Oldest block both nodes still serve.
+    history_floor: BlockNumber,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -783,6 +844,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: false,
             use_finality_tags: false,
             use_execution_witness: false,
+            history_floor: 0,
             rate_limit_rps: None,
         }
     }
@@ -827,6 +889,14 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Sets the oldest block both nodes still serve, such as the result of
+    /// [`earliest_available_block`] for a pruned node. A non-zero floor skips the genesis-pinned
+    /// `earliest` tag comparisons.
+    pub const fn with_history_floor(mut self, block: BlockNumber) -> Self {
+        self.history_floor = block;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -845,6 +915,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: self.skip_extended_eth,
             use_finality_tags: self.use_finality_tags,
             use_execution_witness: self.use_execution_witness,
+            history_floor: self.history_floor,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
@@ -873,6 +944,18 @@ mod tests {
             message: message.to_string().into(),
             data: Some(serde_json::value::RawValue::from_string(data.to_string()).unwrap()),
         })
+    }
+
+    #[test]
+    fn parses_earliest_available_from_pruned_history_error() {
+        assert_eq!(
+            parse_earliest_available(
+                "pruned history unavailable: requested 25892652, earliest available 26350000"
+            ),
+            Some(26_350_000)
+        );
+        assert_eq!(parse_earliest_available("header not found"), None);
+        assert_eq!(parse_earliest_available("earliest available"), None);
     }
 
     #[test]
