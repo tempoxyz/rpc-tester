@@ -3,7 +3,7 @@
 use alloy_provider::{network::AnyNetwork, Provider, ProviderBuilder};
 use alloy_rpc_types::SyncStatus;
 use clap::Parser;
-use rpc_tester::{historical_blocks, RpcTester};
+use rpc_tester::{earliest_available_block, historical_blocks, RpcTester};
 use std::{
     ops::RangeInclusive,
     time::{Duration, Instant},
@@ -93,6 +93,17 @@ async fn main() -> eyre::Result<()> {
         wait_for_readiness(&rpc1, &rpc2, args.num_blocks, Duration::from_secs(args.timeout))
             .await?;
 
+    // A pruned node cannot serve history below its earliest block, so blocks either node pruned
+    // are left out instead of failing as diffs.
+    let head = *block_range.end();
+    let history_floor = earliest_available_block(&rpc1, head, args.rate_limit)
+        .await?
+        .max(earliest_available_block(&rpc2, head, args.rate_limit).await?);
+    if history_floor > 0 {
+        info!(history_floor, "history below this block is pruned on at least one node");
+    }
+    let block_range = (*block_range.start()).max(history_floor)..=head;
+
     let tester = RpcTester::builder(rpc1, rpc2)
         .with_tracing(args.use_tracing)
         .with_reth(args.use_reth)
@@ -102,12 +113,13 @@ async fn main() -> eyre::Result<()> {
         .with_execution_witness(args.use_execution_witness)
         .with_ots(args.use_ots)
         .with_tempo(args.use_tempo)
+        .with_history_floor(history_floor)
         .with_rate_limit(args.rate_limit)
         .build();
 
     // Random historical samples beyond the tip range; see `historical_blocks` for the scheme.
     let mut historical = historical_blocks(*block_range.end(), args.num_blocks as usize);
-    historical.retain(|block| !block_range.contains(block));
+    historical.retain(|block| *block >= history_floor && !block_range.contains(block));
     info!(blocks = ?historical, "sampled historical blocks");
 
     // Run both suites to completion before failing so a diff in one does not hide the other.

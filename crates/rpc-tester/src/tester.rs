@@ -67,6 +67,9 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     use_ots: bool,
     /// Whether to query Tempo's `tempo` namespace.
     use_tempo: bool,
+    /// Oldest block both nodes still serve. Anything below it was pruned on at least one node, so
+    /// the genesis-pinned `earliest` tag is only compared when this is zero.
+    history_floor: BlockNumber,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -476,24 +479,36 @@ where
 
     /// Verifies RPC calls addressed by block tag rather than number or hash.
     ///
-    /// `earliest` is compared unconditionally since it is pinned to genesis. `safe` and
+    /// `earliest` is pinned to genesis, so it is compared only when neither node pruned it (see
+    /// [`RpcTesterBuilder::with_history_floor`]). `safe` and
     /// `finalized` move with the chain and require both nodes to share a consensus view, so they
     /// are gated behind the finality tags option.
     async fn test_tags(&self) -> Result<(), eyre::Error> {
-        #[rustfmt::skip]
-        let mut tests = vec![
-            rpc!(self, get_block_by_number, BlockNumberOrTag::Earliest; kind(alloy_rpc_types::BlockTransactionsKind::Full)),
-            rpc!(self, get_block_transaction_count_by_number, BlockNumberOrTag::Earliest),
-            rpc!(self, get_block_receipts, BlockId::Number(BlockNumberOrTag::Earliest)),
-            rpc!(self, get_uncle_count, BlockId::Number(BlockNumberOrTag::Earliest)),
-            rpc_raw!(self, tempo_forkSchedule, JsonValue, ()),
-        ];
+        let mut tests = Vec::new();
+
+        if self.history_floor == 0 {
+            #[rustfmt::skip]
+            tests.extend([
+                rpc!(self, get_block_by_number, BlockNumberOrTag::Earliest; kind(alloy_rpc_types::BlockTransactionsKind::Full)),
+                rpc!(self, get_block_transaction_count_by_number, BlockNumberOrTag::Earliest),
+                rpc!(self, get_block_receipts, BlockId::Number(BlockNumberOrTag::Earliest)),
+                rpc!(self, get_uncle_count, BlockId::Number(BlockNumberOrTag::Earliest)),
+            ]);
+        } else {
+            info!(history_floor = self.history_floor, "skipping `earliest` tag, genesis is pruned");
+        }
+
+        tests.push(rpc_raw!(self, tempo_forkSchedule, JsonValue, ()));
 
         if self.use_finality_tags {
             for tag in [BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized] {
                 #[rustfmt::skip]
                 tests.push(rpc!(self, get_block_by_number, tag; kind(alloy_rpc_types::BlockTransactionsKind::Hashes)));
             }
+        }
+
+        if tests.is_empty() {
+            return Ok(());
         }
 
         report(vec![("Block tags".to_string(), futures::future::join_all(tests).await)])
@@ -830,6 +845,90 @@ fn error_data(data: Option<&serde_json::value::RawValue>) -> Option<&str> {
     data.map(|data| data.get()).filter(|data| *data != "\"0x\"")
 }
 
+/// Returns the oldest block `provider` still serves, at most `head`.
+///
+/// Probes genesis first. A pruned reth node rejects it with an error naming the earliest
+/// available block, which is used directly; otherwise the lowest block the node returns is found
+/// by binary search, assuming pruning only removes a contiguous prefix of history.
+///
+/// Only a missing block or a pruned-history error counts as pruned. Any other error (a timeout,
+/// a rate limit, a node bug) is returned, so it fails the run instead of silently raising the
+/// floor. With `rate_limit_rps`, probes are spaced to stay within it.
+pub async fn earliest_available_block<P: Provider<AnyNetwork>>(
+    provider: &P,
+    head: BlockNumber,
+    rate_limit_rps: Option<u32>,
+) -> Result<BlockNumber> {
+    let interval =
+        rate_limit_rps.map(|rps| std::time::Duration::from_secs_f64(1.0 / rps.max(1) as f64));
+    let probe = |block: BlockNumber| async move {
+        if let Some(interval) = interval {
+            tokio::time::sleep(interval).await;
+        }
+        let response = provider.get_block_by_number(BlockNumberOrTag::Number(block)).await;
+        classify_probe(response.map(|block| block.is_some()))
+    };
+
+    match probe(0).await? {
+        Probe::Available => return Ok(0),
+        Probe::Pruned(Some(earliest)) => return Ok(earliest.min(head)),
+        Probe::Pruned(None) => {
+            debug!("genesis unavailable, searching for the earliest available block")
+        }
+    }
+
+    let (mut lo, mut hi) = (1, head);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match probe(mid).await? {
+            Probe::Available => hi = mid,
+            Probe::Pruned(Some(earliest)) => return Ok(earliest.min(head)),
+            Probe::Pruned(None) => lo = mid + 1,
+        }
+    }
+    Ok(lo)
+}
+
+/// Outcome of probing whether a node serves a block.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// The node returned the block.
+    Available,
+    /// The node pruned the block, with the earliest available block when its error names one.
+    Pruned(Option<BlockNumber>),
+}
+
+/// Reth's JSON-RPC error code for history that pruning removed.
+const PRUNED_HISTORY_ERROR_CODE: i64 = 4444;
+
+/// Classifies a block probe: a missing block or a pruned-history error is pruned, any other error
+/// is returned.
+fn classify_probe(response: Result<bool, TransportError>) -> Result<Probe> {
+    match response {
+        Ok(true) => Ok(Probe::Available),
+        Ok(false) => Ok(Probe::Pruned(None)),
+        Err(err) => {
+            if let Some(resp) = err.as_error_resp() {
+                let earliest = parse_earliest_available(&resp.message);
+                if resp.code == PRUNED_HISTORY_ERROR_CODE || earliest.is_some() {
+                    return Ok(Probe::Pruned(earliest));
+                }
+            }
+            Err(eyre::eyre!("probing for the earliest available block failed: {err}"))
+        }
+    }
+}
+
+/// Extracts `N` from an error message containing `earliest available N`, as reth's
+/// pruned-history error (code 4444) does:
+/// `pruned history unavailable: requested 1, earliest available 26350000`.
+fn parse_earliest_available(message: &str) -> Option<BlockNumber> {
+    let (_, rest) = message.split_once("earliest available")?;
+    let digits: String =
+        rest.trim_start_matches([' ', ':']).chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Returns tracing options for the geth `callTracer`.
 fn call_tracer_opts() -> GethDebugTracingOptions {
     GethDebugTracingOptions::default()
@@ -915,6 +1014,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_ots: bool,
     /// Whether to query Tempo's `tempo` namespace.
     use_tempo: bool,
+    /// Oldest block both nodes still serve.
+    history_floor: BlockNumber,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -933,6 +1034,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_execution_witness: false,
             use_ots: false,
             use_tempo: false,
+            history_floor: 0,
             rate_limit_rps: None,
         }
     }
@@ -989,6 +1091,14 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Sets the oldest block both nodes still serve, such as the result of
+    /// [`earliest_available_block`] for a pruned node. A non-zero floor skips the genesis-pinned
+    /// `earliest` tag comparisons.
+    pub const fn with_history_floor(mut self, block: BlockNumber) -> Self {
+        self.history_floor = block;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -1009,6 +1119,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_execution_witness: self.use_execution_witness,
             use_ots: self.use_ots,
             use_tempo: self.use_tempo,
+            history_floor: self.history_floor,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
@@ -1037,6 +1148,40 @@ mod tests {
             message: message.to_string().into(),
             data: Some(serde_json::value::RawValue::from_string(data.to_string()).unwrap()),
         })
+    }
+
+    #[test]
+    fn parses_earliest_available_from_pruned_history_error() {
+        assert_eq!(
+            parse_earliest_available(
+                "pruned history unavailable: requested 25892652, earliest available 26350000"
+            ),
+            Some(26_350_000)
+        );
+        assert_eq!(parse_earliest_available("header not found"), None);
+        assert_eq!(parse_earliest_available("earliest available"), None);
+    }
+
+    #[test]
+    fn classifies_block_probes() {
+        assert_eq!(classify_probe(Ok(true)).unwrap(), Probe::Available);
+        assert_eq!(classify_probe(Ok(false)).unwrap(), Probe::Pruned(None));
+        assert_eq!(
+            classify_probe(Err(error_resp(
+                4444,
+                "pruned history unavailable: requested 1, earliest available 26350000"
+            )))
+            .unwrap(),
+            Probe::Pruned(Some(26_350_000))
+        );
+        assert_eq!(
+            classify_probe(Err(error_resp(4444, "pruned history unavailable"))).unwrap(),
+            Probe::Pruned(None)
+        );
+        // Rate limits, transport failures and other errors must not count as pruned.
+        assert!(classify_probe(Err(error_resp(429, "too many requests"))).is_err());
+        assert!(classify_probe(Err(error_resp(-32000, "internal error"))).is_err());
+        assert!(classify_probe(Err(TransportErrorKind::backend_gone())).is_err());
     }
 
     #[test]
