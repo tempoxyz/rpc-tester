@@ -3,7 +3,9 @@
 use alloy_provider::{network::AnyNetwork, Provider, ProviderBuilder};
 use alloy_rpc_types::SyncStatus;
 use clap::Parser;
-use rpc_tester::{earliest_available_block, historical_blocks, RpcTester};
+use rpc_tester::{
+    earliest_available_block, earliest_available_state, historical_blocks, RpcTester,
+};
 use std::{
     ops::RangeInclusive,
     time::{Duration, Instant},
@@ -64,6 +66,13 @@ pub struct CliArgs {
     #[arg(long)]
     pub use_tempo: bool,
 
+    /// Whether either node runs with `--minimal` pruning.
+    ///
+    /// Skips lookups by transaction hash and anything read from receipts, which such a node
+    /// prunes, and keeps historical samples within the state both nodes still serve.
+    #[arg(long)]
+    pub minimal: bool,
+
     /// Maximum time to wait for syncing in seconds
     #[arg(long, value_name = "TIMEOUT", default_value = "300")]
     pub timeout: u64,
@@ -96,9 +105,20 @@ async fn main() -> eyre::Result<()> {
     // A pruned node cannot serve history below its earliest block, so blocks either node pruned
     // are left out instead of failing as diffs.
     let head = *block_range.end();
-    let history_floor = earliest_available_block(&rpc1, head, args.rate_limit)
+    let mut history_floor = earliest_available_block(&rpc1, head, args.rate_limit)
         .await?
         .max(earliest_available_block(&rpc2, head, args.rate_limit).await?);
+    if args.minimal {
+        let state_floor = earliest_available_state(&rpc1, head, args.rate_limit)
+            .await?
+            .max(earliest_available_state(&rpc2, head, args.rate_limit).await?);
+        let floor = history_floor.max(state_floor);
+        // Pruning keeps raising the floor while the run is in flight, so a quarter of the
+        // retained window is left as headroom.
+        if floor > 0 {
+            history_floor = floor + (head - floor) / 4;
+        }
+    }
     if history_floor > 0 {
         info!(history_floor, "history below this block is pruned on at least one node");
     }
@@ -114,6 +134,7 @@ async fn main() -> eyre::Result<()> {
         .with_ots(args.use_ots)
         .with_tempo(args.use_tempo)
         .with_history_floor(history_floor)
+        .with_minimal(args.minimal)
         .with_rate_limit(args.rate_limit)
         .build();
 
