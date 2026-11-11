@@ -298,19 +298,33 @@ where
                 } else {
                     self.rpc2.get_transaction_receipt(tx_hash).await?
                 };
+
+                // State of the contract that emitted the first log at this block or, without a
+                // receipt, of the contract the transaction calls (a Tempo transaction's first
+                // call). These hit the bytecode and (historical) storage paths, which no other
+                // call exercises.
+                let state_address = match &receipt {
+                    Some(receipt) => receipt.inner.inner.logs().first().map(|log| log.address()),
+                    None => tx_json
+                        .get("to")
+                        .filter(|to| !to.is_null())
+                        .or_else(|| tx_json.pointer("/calls/0/to"))
+                        .and_then(JsonValue::as_str)
+                        .and_then(|to| to.parse().ok()),
+                };
+                if let Some(address) = state_address {
+                    #[rustfmt::skip]
+                    let state_calls = vec![
+                        rpc_with_block!(self, get_code_at, address; block_id),
+                        rpc_with_block!(self, get_storage_at, address, U256::ZERO; block_id),
+                    ];
+                    tests.extend(state_calls);
+                }
+
                 if let Some(receipt) = receipt {
                     if let Some(log) = receipt.inner.inner.logs().first().map(|l| l.address()) {
                         #[rustfmt::skip]
                         tests.push(get_logs!(self, Filter::new().select(block_number).address(log)));
-
-                        // State of the contract that emitted the log at this block. These hit the
-                        // bytecode and (historical) storage paths, which no other call exercises.
-                        #[rustfmt::skip]
-                        let state_calls = vec![
-                            rpc_with_block!(self, get_code_at, log; block_id),
-                            rpc_with_block!(self, get_storage_at, log, U256::ZERO; block_id),
-                        ];
-                        tests.extend(state_calls);
                     }
 
                     if let Some(topic) = receipt
