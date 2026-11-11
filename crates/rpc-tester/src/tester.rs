@@ -241,7 +241,7 @@ where
                     );
                     let fee_simulate_args = (
                         serde_json::json!({
-                            "blockStateCalls": [{ "calls": [fee_call_args.0.clone()] }],
+                            "blockStateCalls": [{ "calls": [fee_call_args.0] }],
                             "traceTransfers": true,
                         }),
                         parent,
