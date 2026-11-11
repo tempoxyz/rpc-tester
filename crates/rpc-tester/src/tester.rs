@@ -65,6 +65,8 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     use_execution_witness: bool,
     /// Whether to query Otterscan's `ots` namespace, which only some clients serve.
     use_ots: bool,
+    /// Whether to query Tempo's `tempo` namespace.
+    use_tempo: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -186,20 +188,21 @@ where
             tests.extend(ots_block_calls);
 
             // // Transaction/Receipt based RPCs
-            let mut seen_tx_types = Vec::new();
+            let mut seen_sample_keys = Vec::new();
             for (index, tx) in block.transactions.txns().enumerate() {
                 let tx_json = serde_json::to_value(tx).expect("should json");
 
                 // Without --use-all-txes, sample the first transaction of each distinct type
                 // instead of just the first of the block: the first transaction is often the same
                 // kind of searcher activity, while rarer types (blob, 7702, legacy) exercise
-                // different serialization and execution paths.
+                // different serialization and execution paths. Tempo transactions are further
+                // split by the features that take their own paths, see `sample_key`.
                 if !self.use_all_txes {
-                    let tx_type = tx_json.get("type").cloned();
-                    if seen_tx_types.contains(&tx_type) {
+                    let key = sample_key(&tx_json);
+                    if seen_sample_keys.contains(&key) {
                         continue;
                     }
-                    seen_tx_types.push(tx_type);
+                    seen_sample_keys.push(key);
                 }
 
                 let (tx_hash, tx_from) = (tx.tx_hash(), tx.from());
@@ -214,6 +217,11 @@ where
                 let call_args = (request.clone(), parent);
                 let estimate_args = call_args.clone();
                 let access_list_args = call_args.clone();
+                // Tempo's simulation adds the metadata of every TIP-20 token in the logs.
+                let tempo_simulate_args = (
+                    serde_json::json!({ "blockStateCalls": [{ "calls": [request.clone()] }] }),
+                    parent,
+                );
                 // The traced replays cover the tracers on a call, which has no receipt to fill
                 // the root frame from.
                 let trace_call_args = (request.clone(), parent, call_tracer_with_log_opts());
@@ -226,8 +234,38 @@ where
                     rpc_raw!(self, eth_createAccessList, AccessListResult, access_list_args),
                     rpc_raw!(self, debug_traceCall, JsonValue, trace_call_args),
                     rpc_raw!(self, trace_call, JsonValue, parity_call_args),
+                    rpc_raw!(self, tempo_simulateV1, JsonValue, tempo_simulate_args),
                 ];
                 tests.extend(exec_calls);
+
+                if self.use_tempo {
+                    // Replays with the transaction's own fees, fee token and authorizations, which
+                    // the fee-free replays drop. Calls, estimates and traced calls still resolve
+                    // and validate the fee token but skip fee collection, so only the simulation
+                    // charges and refunds it, emitting logs outside any call frame.
+                    let fee_call_args = (fee_call_request_json(&tx_json), parent);
+                    let fee_estimate_args = fee_call_args.clone();
+                    let fee_prestate_args = (
+                        fee_call_args.0.clone(),
+                        parent,
+                        serde_json::json!({ "tracer": "prestateTracer", "tracerConfig": { "diffMode": true } }),
+                    );
+                    let fee_simulate_args = (
+                        serde_json::json!({
+                            "blockStateCalls": [{ "calls": [fee_call_args.0] }],
+                            "traceTransfers": true,
+                        }),
+                        parent,
+                    );
+                    #[rustfmt::skip]
+                    let fee_calls = vec![
+                        rpc_raw!(self, eth_call, Bytes, fee_call_args),
+                        rpc_raw!(self, eth_estimateGas, U256, fee_estimate_args),
+                        rpc_raw!(self, debug_traceCall, JsonValue, fee_prestate_args),
+                        rpc_raw!(self, tempo_simulateV1, JsonValue, fee_simulate_args),
+                    ];
+                    tests.extend(fee_calls);
+                }
 
                 if !self.skip_extended_eth {
                     // Simulation builds a block around the call, with receipts, logs and
@@ -448,6 +486,7 @@ where
             rpc!(self, get_block_transaction_count_by_number, BlockNumberOrTag::Earliest),
             rpc!(self, get_block_receipts, BlockId::Number(BlockNumberOrTag::Earliest)),
             rpc!(self, get_uncle_count, BlockId::Number(BlockNumberOrTag::Earliest)),
+            rpc_raw!(self, tempo_forkSchedule, JsonValue, ()),
         ];
 
         if self.use_finality_tags {
@@ -582,6 +621,7 @@ where
             !self.use_ots
         } else {
             name.starts_with("reth") && !self.use_reth ||
+                name.starts_with("tempo") && !self.use_tempo ||
                 (name.contains("trace") || name.starts_with("debug")) && !self.use_tracing
         };
         if skip {
@@ -664,7 +704,8 @@ fn normalize_access_list_result(value: &mut JsonValue) {
 }
 
 /// Builds an `eth_call` request object from a transaction response's JSON, keeping a minimal
-/// subset of fields (`from`, `to`, `gas`, `value`, `input`).
+/// subset of fields (`from`, `to`, `gas`, `value`, `input`, and a Tempo transaction's `calls`,
+/// nonce key and validity window).
 ///
 /// Access and authorization lists are dropped, so the call is not a faithful replay — but both
 /// nodes receive the identical request, so parity still holds. The gas price is pinned to zero
@@ -678,8 +719,90 @@ fn call_request_json(tx: &serde_json::Value) -> serde_json::Value {
             request.insert(key.to_string(), value.clone());
         }
     }
+    // A Tempo transaction runs its calls instead of `to` and `input`.
+    if let Some(calls) = tx.get("calls").and_then(JsonValue::as_array).filter(|c| !c.is_empty()) {
+        let calls = calls
+            .iter()
+            .map(|call| {
+                let fields = ["to", "value", "input"].into_iter().filter_map(|key| {
+                    let value = call.get(key).filter(|value| !value.is_null())?;
+                    Some((key.to_string(), value.clone()))
+                });
+                JsonValue::Object(fields.collect())
+            })
+            .collect();
+        request.insert("calls".to_string(), JsonValue::Array(calls));
+        // Without its nonce key, a transaction on an expiring or 2D nonce replays on the protocol
+        // nonce, which charges new-account gas while that nonce is zero. An expiring nonce also
+        // requires its validity window.
+        for key in ["nonceKey", "validBefore", "validAfter"] {
+            if let Some(value) = tx.get(key).filter(|value| !value.is_null()) {
+                request.insert(key.to_string(), value.clone());
+            }
+        }
+        // Tempo transactions only take EIP-1559 fee fields.
+        for key in ["maxFeePerGas", "maxPriorityFeePerGas"] {
+            request.insert(key.to_string(), JsonValue::String("0x0".to_string()));
+        }
+        return JsonValue::Object(request);
+    }
     request.insert("gasPrice".to_string(), serde_json::Value::String("0x0".to_string()));
     serde_json::Value::Object(request)
+}
+
+/// Builds a call request that pays the transaction's own fees, unlike [`call_request_json`], and
+/// carries a Tempo transaction's fee token, nonce and authorizations.
+///
+/// A sponsored transaction is replayed with its sender paying, since a fee payer signature does
+/// not cover the request.
+fn fee_call_request_json(tx: &JsonValue) -> JsonValue {
+    let mut request = call_request_json(tx);
+    let request_fields = request.as_object_mut().expect("call request is an object");
+    for key in ["gasPrice", "maxFeePerGas", "maxPriorityFeePerGas"] {
+        request_fields.remove(key);
+    }
+    // Responses report the effective `gasPrice` of EIP-1559 transactions too, and a request may
+    // not carry both kinds of fee fields.
+    let fee_fields: &[&str] = if tx.get("maxFeePerGas").is_some_and(|fee| !fee.is_null()) {
+        &["maxFeePerGas", "maxPriorityFeePerGas"]
+    } else {
+        &["gasPrice"]
+    };
+    let tempo_fields = ["feeToken", "nonce", "keyAuthorization"];
+    let list_fields = ["accessList", "authorizationList", "aaAuthorizationList"];
+    for key in fee_fields.iter().chain(&tempo_fields).chain(&list_fields) {
+        let Some(value) = tx.get(*key).filter(|value| !value.is_null()) else { continue };
+        if value.as_array().is_some_and(Vec::is_empty) {
+            continue;
+        }
+        request_fields.insert((*key).to_string(), value.clone());
+    }
+    request
+}
+
+/// Returns the key that groups transactions for sampling: the type, and for a Tempo transaction
+/// also whether it batches calls, whether it creates a contract, its nonce kind, sponsorship, key
+/// authorization and signature type, which each take their own execution or tracing path.
+fn sample_key(tx: &JsonValue) -> JsonValue {
+    let tx_type = tx.get("type").cloned().unwrap_or_default();
+    let Some(calls) = tx.get("calls").and_then(JsonValue::as_array) else { return tx_type };
+    let is_set = |key: &str| tx.get(key).is_some_and(|value| !value.is_null());
+    let nonce = match tx.get("nonceKey").and_then(JsonValue::as_str) {
+        None | Some("0x0") => "protocol",
+        // An expiring nonce uses the maximum nonce key.
+        Some(key) if key.len() == 66 && key[2..].bytes().all(|byte| byte == b'f') => "expiring",
+        Some(_) => "2d",
+    };
+    serde_json::json!([
+        tx_type,
+        calls.len() > 1,
+        // Only the first call may create a contract.
+        calls.first().is_some_and(|call| call.get("to").is_none_or(JsonValue::is_null)),
+        nonce,
+        is_set("feePayerSignature"),
+        is_set("keyAuthorization"),
+        tx.pointer("/signature/type"),
+    ])
 }
 
 /// Returns whether two RPC errors are the same error response.
@@ -790,6 +913,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_execution_witness: bool,
     /// Whether to query Otterscan's `ots` namespace.
     use_ots: bool,
+    /// Whether to query Tempo's `tempo` namespace.
+    use_tempo: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -807,6 +932,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_finality_tags: false,
             use_execution_witness: false,
             use_ots: false,
+            use_tempo: false,
             rate_limit_rps: None,
         }
     }
@@ -857,6 +983,12 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Enables or disables querying Tempo's `tempo` namespace.
+    pub const fn with_tempo(mut self, is_enabled: bool) -> Self {
+        self.use_tempo = is_enabled;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -876,6 +1008,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_finality_tags: self.use_finality_tags,
             use_execution_witness: self.use_execution_witness,
             use_ots: self.use_ots,
+            use_tempo: self.use_tempo,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
@@ -959,6 +1092,91 @@ mod tests {
             &TransportErrorKind::backend_gone()
         ));
         assert!(!errors_match(&TransportErrorKind::backend_gone(), &error_resp(-32000, "a")));
+    }
+
+    #[test]
+    fn fee_replay_pays_the_transaction_fees() {
+        let tx = json!({
+            "type": "0x76",
+            "from": "0xaa",
+            "gas": "0x5208",
+            "gasPrice": "0x5",
+            "maxFeePerGas": "0x9",
+            "maxPriorityFeePerGas": "0x1",
+            "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01" }],
+            "feeToken": "0xcc",
+            "nonce": "0x2",
+            "nonceKey": "0x1",
+            "validBefore": null,
+            "feePayerSignature": { "r": "0x1" },
+            "aaAuthorizationList": [],
+        });
+        assert_eq!(
+            fee_call_request_json(&tx),
+            json!({
+                "from": "0xaa",
+                "gas": "0x5208",
+                "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01" }],
+                "maxFeePerGas": "0x9",
+                "maxPriorityFeePerGas": "0x1",
+                "feeToken": "0xcc",
+                "nonce": "0x2",
+                "nonceKey": "0x1",
+            })
+        );
+
+        let legacy = json!({ "type": "0x0", "from": "0xaa", "to": "0xbb", "gasPrice": "0x5" });
+        assert_eq!(
+            fee_call_request_json(&legacy),
+            json!({ "from": "0xaa", "to": "0xbb", "gasPrice": "0x5" })
+        );
+    }
+
+    #[test]
+    fn samples_tempo_transactions_by_feature() {
+        let tx = |calls: usize, nonce_key: &str| {
+            json!({
+                "type": "0x76",
+                "calls": vec![json!({ "to": "0xbb" }); calls],
+                "nonceKey": nonce_key,
+                "signature": { "type": "secp256k1" },
+            })
+        };
+        let single = sample_key(&tx(1, "0x0"));
+        assert_ne!(single, sample_key(&tx(2, "0x0")));
+        assert_ne!(single, sample_key(&tx(1, "0x5")));
+        assert_ne!(sample_key(&tx(1, "0x5")), sample_key(&tx(1, &format!("0x{}", "f".repeat(64)))));
+        assert_eq!(single, sample_key(&tx(1, "0x0")));
+
+        let mut create = tx(2, "0x0");
+        create["calls"][0]["to"] = JsonValue::Null;
+        assert_ne!(sample_key(&tx(2, "0x0")), sample_key(&create));
+        assert_eq!(sample_key(&json!({ "type": "0x2", "to": "0xbb" })), json!("0x2"));
+    }
+
+    #[test]
+    fn replays_tempo_calls() {
+        let tx = json!({
+            "type": "0x76",
+            "from": "0xaa",
+            "gas": "0x5208",
+            "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01", "data": null }],
+            "nonceKey": "0x1",
+            "validBefore": "0x64",
+            "validAfter": null,
+        });
+        assert_eq!(
+            call_request_json(&tx),
+            json!({
+                "from": "0xaa",
+                "gas": "0x5208",
+                "calls": [{ "to": "0xbb", "value": "0x0", "input": "0x01" }],
+                "nonceKey": "0x1",
+                "validBefore": "0x64",
+                "maxFeePerGas": "0x0",
+                "maxPriorityFeePerGas": "0x0",
+            })
+        );
     }
 
     #[test]
