@@ -57,6 +57,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub use_execution_witness: bool,
 
+    /// Whether to query Otterscan's `ots` namespace.
+    #[arg(long)]
+    pub use_ots: bool,
+
     /// Maximum time to wait for syncing in seconds
     #[arg(long, value_name = "TIMEOUT", default_value = "300")]
     pub timeout: u64,
@@ -93,6 +97,7 @@ async fn main() -> eyre::Result<()> {
         .skip_extended_eth(args.skip_extended_eth)
         .with_finality_tags(args.use_finality_tags)
         .with_execution_witness(args.use_execution_witness)
+        .with_ots(args.use_ots)
         .with_rate_limit(args.rate_limit)
         .build();
 
