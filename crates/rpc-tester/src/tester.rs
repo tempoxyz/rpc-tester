@@ -13,7 +13,7 @@ use alloy_rpc_types_trace::{
     filter::TraceFilter,
     geth::{
         CallConfig, FlatCallConfig, GethDebugBuiltInTracerType, GethDebugTracerType,
-        GethDebugTracingOptions, PreStateConfig,
+        GethDebugTracingOptions, GethDefaultTracingOptions, PreStateConfig,
     },
     parity::{LocalizedTransactionTrace, TraceType},
 };
@@ -63,6 +63,8 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Whether to compare `debug_executionWitness` for the newest tested block. Witness
     /// generation re-executes the block, so this is opt-in.
     use_execution_witness: bool,
+    /// Whether to query Otterscan's `ots` namespace, which only some clients serve.
+    use_ots: bool,
     /// Whether to query Tempo's `tempo` namespace.
     use_tempo: bool,
     /// Maximum requests per second for rate limiting.
@@ -177,6 +179,13 @@ where
             ];
 
             tests.extend(block_calls);
+
+            #[rustfmt::skip]
+            let ots_block_calls = vec![
+                rpc_raw!(self, ots_getBlockDetails, JsonValue, (block_number,)),
+                rpc_raw!(self, ots_getBlockTransactions, JsonValue, (block_number, 0, 10)),
+            ];
+            tests.extend(ots_block_calls);
 
             // // Transaction/Receipt based RPCs
             let mut seen_sample_keys = Vec::new();
@@ -352,9 +361,20 @@ where
                     rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_opts()),
                     rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_with_precompiles_opts()),
                     rpc!(self, debug_trace_transaction, tx_hash, four_byte_tracer_opts()),
+                    rpc!(self, debug_trace_transaction, tx_hash, struct_log_opts()),
                     rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::Trace, TraceType::StateDiff])),
                 ];
                 tests.extend(tx_calls);
+
+                // Otterscan builds its own call tree and internal operations from separate
+                // inspectors, which can diverge from the other tracers.
+                #[rustfmt::skip]
+                let ots_tx_calls = vec![
+                    rpc_raw!(self, ots_traceTransaction, JsonValue, (tx_hash,)),
+                    rpc_raw!(self, ots_getInternalOperations, JsonValue, (tx_hash,)),
+                    rpc_raw!(self, ots_getTransactionError, JsonValue, (tx_hash,)),
+                ];
+                tests.extend(ots_tx_calls);
 
                 if !self.skip_extended_eth {
                     #[rustfmt::skip]
@@ -594,9 +614,11 @@ where
         // The debug namespace is gated together with tracing: `debug_getRaw*` are typically
         // enabled alongside the trace methods, and running them against nodes without the
         // namespace would fail every block. `debug_executionWitness` has its own opt-in,
-        // independent of the tracing gate.
+        // independent of the tracing gate, and so does the `ots` namespace.
         let skip = if name == "debug_executionWitness" {
             !self.use_execution_witness
+        } else if name.starts_with("ots") {
+            !self.use_ots
         } else {
             name.starts_with("reth") && !self.use_reth ||
                 name.starts_with("tempo") && !self.use_tempo ||
@@ -860,6 +882,15 @@ fn four_byte_tracer_opts() -> GethDebugTracingOptions {
         .with_tracer(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::FourByteTracer))
 }
 
+/// Returns tracing options for the default struct logger without stack and storage, which
+/// compares every executed opcode's gas, cost, depth and refund while keeping responses small.
+fn struct_log_opts() -> GethDebugTracingOptions {
+    GethDebugTracingOptions {
+        config: GethDefaultTracingOptions::default().disable_stack().disable_storage(),
+        ..Default::default()
+    }
+}
+
 /// Builder for [`RpcTester`].
 #[derive(Debug)]
 pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
@@ -880,6 +911,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_finality_tags: bool,
     /// Whether to compare `debug_executionWitness` for the newest tested block.
     use_execution_witness: bool,
+    /// Whether to query Otterscan's `ots` namespace.
+    use_ots: bool,
     /// Whether to query Tempo's `tempo` namespace.
     use_tempo: bool,
     /// Maximum requests per second for rate limiting.
@@ -898,6 +931,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: false,
             use_finality_tags: false,
             use_execution_witness: false,
+            use_ots: false,
             use_tempo: false,
             rate_limit_rps: None,
         }
@@ -943,6 +977,12 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Enables or disables Otterscan's `ots` namespace, which only some clients serve.
+    pub const fn with_ots(mut self, is_enabled: bool) -> Self {
+        self.use_ots = is_enabled;
+        self
+    }
+
     /// Enables or disables querying Tempo's `tempo` namespace.
     pub const fn with_tempo(mut self, is_enabled: bool) -> Self {
         self.use_tempo = is_enabled;
@@ -967,6 +1007,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             skip_extended_eth: self.skip_extended_eth,
             use_finality_tags: self.use_finality_tags,
             use_execution_witness: self.use_execution_witness,
+            use_ots: self.use_ots,
             use_tempo: self.use_tempo,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),

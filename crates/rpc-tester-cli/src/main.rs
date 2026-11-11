@@ -57,6 +57,9 @@ pub struct CliArgs {
     #[arg(long)]
     pub use_execution_witness: bool,
 
+    /// Whether to query Otterscan's `ots` namespace.
+    #[arg(long)]
+    pub use_ots: bool,
     /// Whether to query Tempo's `tempo` namespace.
     #[arg(long)]
     pub use_tempo: bool,
@@ -97,6 +100,7 @@ async fn main() -> eyre::Result<()> {
         .skip_extended_eth(args.skip_extended_eth)
         .with_finality_tags(args.use_finality_tags)
         .with_execution_witness(args.use_execution_witness)
+        .with_ots(args.use_ots)
         .with_tempo(args.use_tempo)
         .with_rate_limit(args.rate_limit)
         .build();

@@ -13,6 +13,12 @@ const IGNORED_FIELDS: &[&str] = &["error"];
 /// such as in call traces, `error` is a call's failure and is compared.
 const RECEIPT_METHODS: &[&str] = &["get_transaction_receipt", "get_block_receipts"];
 
+/// Simulated block header fields that depend on whether synthetic transfer logs (from
+/// `traceTransfers`) count towards the block's receipts. Clients disagree on this: reth up to
+/// v2.10 includes them, while newer reth leaves them out like geth. The transfer logs themselves
+/// are still compared.
+const SIMULATED_BLOCK_IGNORED_FIELDS: &[&str] = &["logsBloom", "receiptsRoot", "hash"];
+
 /// Prints test results to console.
 ///
 /// Returns error if RPC1 is missing/mismatching any element against RPC2 on any rpc method.
@@ -31,6 +37,8 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
                     // Filter out client-specific extension fields before comparison
                     let (rpc1, rpc2) = if RECEIPT_METHODS.contains(&name.as_str()) {
                         (filter_ignored_fields(rpc1), filter_ignored_fields(rpc2))
+                    } else if name == "eth_simulateV1" {
+                        (filter_simulated_blocks(rpc1), filter_simulated_blocks(rpc2))
                     } else {
                         (rpc1, rpc2)
                     };
@@ -98,6 +106,25 @@ fn filter_ignored_fields(value: Value) -> Value {
         Value::Array(arr) => Value::Array(arr.into_iter().map(filter_ignored_fields).collect()),
         other => other,
     }
+}
+
+/// Removes [`SIMULATED_BLOCK_IGNORED_FIELDS`] from each block of an `eth_simulateV1` result, and
+/// the `blockHash` of its calls' logs, which follows the block hash.
+fn filter_simulated_blocks(mut value: Value) -> Value {
+    for block in value.as_array_mut().into_iter().flatten() {
+        let Some(block) = block.as_object_mut() else { continue };
+        for field in SIMULATED_BLOCK_IGNORED_FIELDS {
+            block.remove(*field);
+        }
+        let calls = block.get_mut("calls").and_then(Value::as_array_mut);
+        for call in calls.into_iter().flatten() {
+            let logs = call.get_mut("logs").and_then(Value::as_array_mut);
+            for log in logs.into_iter().flatten().filter_map(Value::as_object_mut) {
+                log.remove("blockHash");
+            }
+        }
+    }
+    value
 }
 
 /// Verifies if there is any missing field/element from rpc1 comparing it to rpc2.
@@ -178,6 +205,32 @@ mod tests {
         };
         let method = "debug_trace_transaction".to_string();
         assert!(report(vec![("t".to_string(), vec![(method, Err(trace_error))])]).is_err());
+
+        // Simulated blocks pass when only the header fields derived from transfer logs differ...
+        let simulated = |bloom: &str, log_address: &str| {
+            json!([{
+                "hash": format!("0x{bloom}"),
+                "logsBloom": bloom,
+                "receiptsRoot": bloom,
+                "number": "0x1",
+                "calls": [{ "logs": [{ "address": log_address, "blockHash": format!("0x{bloom}") }] }],
+            }])
+        };
+        let header_only = TestError::Diff {
+            rpc1: simulated("00", "0xee"),
+            rpc2: simulated("ff", "0xee"),
+            args: None,
+        };
+        let method = "eth_simulateV1".to_string();
+        assert!(report(vec![("t".to_string(), vec![(method.clone(), Err(header_only))])]).is_ok());
+
+        // ...but still fail when the logs differ.
+        let logs_differ = TestError::Diff {
+            rpc1: simulated("00", "0xee"),
+            rpc2: simulated("00", "0xff"),
+            args: None,
+        };
+        assert!(report(vec![("t".to_string(), vec![(method, Err(logs_differ))])]).is_err());
 
         // Error mismatches and node errors always fail.
         let err_diff =

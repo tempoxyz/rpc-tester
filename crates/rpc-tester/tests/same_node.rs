@@ -67,6 +67,7 @@ async fn same_node_passes() {
         .with_all_txes(true)
         .with_finality_tags(true)
         .with_execution_witness(true)
+        .with_ots(true)
         .with_tempo(true)
         .build();
 
