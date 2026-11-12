@@ -4,7 +4,7 @@
 #[doc(hidden)]
 pub mod get_logs;
 mod tester;
-pub use tester::{earliest_available_block, RpcTester};
+pub use tester::{earliest_available_block, earliest_available_state, RpcTester};
 mod report;
 mod sampling;
 pub use sampling::{

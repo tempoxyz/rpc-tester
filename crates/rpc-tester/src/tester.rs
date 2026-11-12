@@ -70,6 +70,10 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// Oldest block both nodes still serve. Anything below it was pruned on at least one node, so
     /// the genesis-pinned `earliest` tag is only compared when this is zero.
     history_floor: BlockNumber,
+    /// Whether either node runs with `--minimal` pruning, which drops the transaction hash index
+    /// and keeps receipts for only the newest 64 blocks, so lookups by hash and anything read from
+    /// receipts are skipped.
+    minimal: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -160,11 +164,9 @@ where
                 rpc!(self, get_uncle_count, BlockId::Number(block_tag)),
                 rpc!(self, get_uncle, BlockId::Hash(block_hash.into()), 0u64),
                 rpc!(self, get_uncle, BlockId::Number(block_tag), 0u64),
-                rpc!(self, get_block_receipts, block_id),
                 // Raw-encoding parity catches divergence that JSON normalization hides.
                 rpc!(self, debug_get_raw_header, block_id),
                 rpc!(self, debug_get_raw_block, block_id),
-                rpc!(self, debug_get_raw_receipts, block_id),
                 rpc_raw!(self, reth_getBalanceChangesInBlock, BalanceChanges, (block_id,)),
                 rpc_raw!(self, eth_getBalance, U256, canonical_args),
                 rpc!(self, trace_block, block_id),
@@ -173,22 +175,29 @@ where
                 rpc!(self, debug_trace_block_by_number, block_tag, call_tracer_opts()),
                 rpc!(self, debug_trace_block_by_number, block_tag, call_tracer_with_log_opts()),
                 rpc!(self, debug_trace_block_by_number, block_tag, prestate_tracer_opts()),
-                get_logs!(self, &Filter::new().select(block_number)),
-                get_logs!(self, &Filter::new().at_block_hash(block_hash)),
-                get_logs!(self, &Filter::new().select(block_number).address(vec![
-                    "0x6b175474e89094c44da98b954eedeac495271d0f".parse::<Address>().unwrap(), // dai
-                    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse::<Address>().unwrap(), // usdc
-                ]))
             ];
 
             tests.extend(block_calls);
 
-            #[rustfmt::skip]
-            let ots_block_calls = vec![
-                rpc_raw!(self, ots_getBlockDetails, JsonValue, (block_number,)),
-                rpc_raw!(self, ots_getBlockTransactions, JsonValue, (block_number, 0, 10)),
-            ];
-            tests.extend(ots_block_calls);
+            // A minimal node keeps receipts for only the newest 64 blocks, which a run outlasts on
+            // fast chains, so everything read from receipts is skipped.
+            if !self.minimal {
+                #[rustfmt::skip]
+                let receipt_calls = vec![
+                    rpc!(self, get_block_receipts, block_id),
+                    rpc!(self, debug_get_raw_receipts, block_id),
+                    get_logs!(self, &Filter::new().select(block_number)),
+                    get_logs!(self, &Filter::new().at_block_hash(block_hash)),
+                    get_logs!(self, &Filter::new().select(block_number).address(vec![
+                        "0x6b175474e89094c44da98b954eedeac495271d0f".parse::<Address>().unwrap(), // dai
+                        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse::<Address>().unwrap(), // usdc
+                    ])),
+                    // Otterscan's block details and transactions are built from receipts.
+                    rpc_raw!(self, ots_getBlockDetails, JsonValue, (block_number,)),
+                    rpc_raw!(self, ots_getBlockTransactions, JsonValue, (block_number, 0, 10)),
+                ];
+                tests.extend(receipt_calls);
+            }
 
             // // Transaction/Receipt based RPCs
             let mut seen_sample_keys = Vec::new();
@@ -283,19 +292,39 @@ where
                     tests.push(rpc_raw!(self, eth_simulateV1, JsonValue, simulate_args));
                 }
 
-                if let Some(receipt) = self.rpc2.get_transaction_receipt(tx_hash).await? {
+                // The log filters below are derived from the receipt, which a minimal node prunes.
+                let receipt = if self.minimal {
+                    None
+                } else {
+                    self.rpc2.get_transaction_receipt(tx_hash).await?
+                };
+
+                // State of the contract that emitted the first log at this block or, without a
+                // receipt, of the contract the transaction calls (a Tempo transaction's first
+                // call). These hit the bytecode and (historical) storage paths, which no other
+                // call exercises.
+                let state_address = match &receipt {
+                    Some(receipt) => receipt.inner.inner.logs().first().map(|log| log.address()),
+                    None => tx_json
+                        .get("to")
+                        .filter(|to| !to.is_null())
+                        .or_else(|| tx_json.pointer("/calls/0/to"))
+                        .and_then(JsonValue::as_str)
+                        .and_then(|to| to.parse().ok()),
+                };
+                if let Some(address) = state_address {
+                    #[rustfmt::skip]
+                    let state_calls = vec![
+                        rpc_with_block!(self, get_code_at, address; block_id),
+                        rpc_with_block!(self, get_storage_at, address, U256::ZERO; block_id),
+                    ];
+                    tests.extend(state_calls);
+                }
+
+                if let Some(receipt) = receipt {
                     if let Some(log) = receipt.inner.inner.logs().first().map(|l| l.address()) {
                         #[rustfmt::skip]
                         tests.push(get_logs!(self, Filter::new().select(block_number).address(log)));
-
-                        // State of the contract that emitted the log at this block. These hit the
-                        // bytecode and (historical) storage paths, which no other call exercises.
-                        #[rustfmt::skip]
-                        let state_calls = vec![
-                            rpc_with_block!(self, get_code_at, log; block_id),
-                            rpc_with_block!(self, get_storage_at, log, U256::ZERO; block_id),
-                        ];
-                        tests.extend(state_calls);
                     }
 
                     if let Some(topic) = receipt
@@ -345,39 +374,42 @@ where
 
                 #[rustfmt::skip]
                 let tx_calls = vec![
-                    rpc!(self, get_raw_transaction_by_hash, tx_hash),
-                    rpc!(self, debug_get_raw_transaction, tx_hash),
-                    rpc!(self, get_transaction_by_hash, tx_hash),
                     rpc!(self, get_transaction_by_block_hash_and_index, block_hash, index),
                     rpc!(self, get_transaction_by_block_number_and_index, block_tag, index),
-                    rpc!(self, get_transaction_receipt, tx_hash),
                     rpc_with_block!(self, get_transaction_count, tx_from; block_id),
                     rpc_with_block!(self, get_balance, tx_from; block_id),
                     // Senders are usually EOAs, but EIP-7702 delegations make sender code
                     // observable.
                     rpc_with_block!(self, get_code_at, tx_from; block_id),
-                    rpc!(self, trace_transaction, tx_hash),
-                    rpc!(self, debug_trace_transaction, tx_hash, call_tracer_opts()),
-                    rpc!(self, debug_trace_transaction, tx_hash, call_tracer_with_log_opts()),
-                    rpc!(self, debug_trace_transaction, tx_hash, prestate_tracer_opts()),
-                    rpc!(self, debug_trace_transaction, tx_hash, prestate_diff_tracer_opts()),
-                    rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_opts()),
-                    rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_with_precompiles_opts()),
-                    rpc!(self, debug_trace_transaction, tx_hash, four_byte_tracer_opts()),
-                    rpc!(self, debug_trace_transaction, tx_hash, struct_log_opts()),
-                    rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::Trace, TraceType::StateDiff])),
                 ];
                 tests.extend(tx_calls);
 
-                // Otterscan builds its own call tree and internal operations from separate
-                // inspectors, which can diverge from the other tracers.
-                #[rustfmt::skip]
-                let ots_tx_calls = vec![
-                    rpc_raw!(self, ots_traceTransaction, JsonValue, (tx_hash,)),
-                    rpc_raw!(self, ots_getInternalOperations, JsonValue, (tx_hash,)),
-                    rpc_raw!(self, ots_getTransactionError, JsonValue, (tx_hash,)),
-                ];
-                tests.extend(ots_tx_calls);
+                // A minimal node prunes the transaction hash index, so it cannot look these up.
+                if !self.minimal {
+                    #[rustfmt::skip]
+                    let tx_hash_calls = vec![
+                        rpc!(self, get_raw_transaction_by_hash, tx_hash),
+                        rpc!(self, debug_get_raw_transaction, tx_hash),
+                        rpc!(self, get_transaction_by_hash, tx_hash),
+                        rpc!(self, get_transaction_receipt, tx_hash),
+                        rpc!(self, trace_transaction, tx_hash),
+                        rpc!(self, debug_trace_transaction, tx_hash, call_tracer_opts()),
+                        rpc!(self, debug_trace_transaction, tx_hash, call_tracer_with_log_opts()),
+                        rpc!(self, debug_trace_transaction, tx_hash, prestate_tracer_opts()),
+                        rpc!(self, debug_trace_transaction, tx_hash, prestate_diff_tracer_opts()),
+                        rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_opts()),
+                        rpc!(self, debug_trace_transaction, tx_hash, flat_call_tracer_with_precompiles_opts()),
+                        rpc!(self, debug_trace_transaction, tx_hash, four_byte_tracer_opts()),
+                        rpc!(self, debug_trace_transaction, tx_hash, struct_log_opts()),
+                        rpc_raw!(self, trace_replayTransaction, JsonValue, (tx_hash, [TraceType::Trace, TraceType::StateDiff])),
+                        // Otterscan builds its own call tree and internal operations from separate
+                        // inspectors, which can diverge from the other tracers.
+                        rpc_raw!(self, ots_traceTransaction, JsonValue, (tx_hash,)),
+                        rpc_raw!(self, ots_getInternalOperations, JsonValue, (tx_hash,)),
+                        rpc_raw!(self, ots_getTransactionError, JsonValue, (tx_hash,)),
+                    ];
+                    tests.extend(tx_hash_calls);
+                }
 
                 if !self.skip_extended_eth {
                     #[rustfmt::skip]
@@ -428,23 +460,30 @@ where
         ))
             as Pin<Box<dyn Future<Output = (MethodName, Result<(), TestError>)> + Send>>;
 
+        // Reward percentiles are computed from receipts, which a minimal node prunes.
+        let reward_percentiles = if self.minimal { &[][..] } else { &[25.0, 50.0, 75.0][..] };
+
         #[rustfmt::skip]
-        report(vec![(
-            format!("{start}..={end}"),
-            futures::future::join_all([
-                rpc!(self, get_chain_id),
-                // Fully deterministic for a historical range anchored to a numeric block.
-                rpc!(self, get_fee_history, end - start + 1, BlockNumberOrTag::Number(end), &[25.0, 50.0, 75.0][..]),
+        let mut tests = vec![
+            rpc!(self, get_chain_id),
+            // Fully deterministic for a historical range anchored to a numeric block.
+            rpc!(self, get_fee_history, end - start + 1, BlockNumberOrTag::Number(end), reward_percentiles),
+            trace_filter_test,
+        ];
+
+        if !self.minimal {
+            #[rustfmt::skip]
+            tests.extend([
                 get_logs!(self, Filter::new().from_block(start).to_block(end)),
                 get_logs!(self, Filter::new().from_block(start).to_block(end).address(vec![
                     "0x6b175474e89094c44da98b954eedeac495271d0f".parse::<Address>().unwrap(), // dai
                     "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse::<Address>().unwrap(), // usdc
                 ])),
                 get_logs!(self, Filter::new().from_block(start).to_block(end).event_signature(transfer_event_signature)),
-                trace_filter_test
-            ])
-            .await,
-        )])?;
+            ]);
+        }
+
+        report(vec![(format!("{start}..={end}"), futures::future::join_all(tests).await)])?;
 
         Ok(())
     }
@@ -859,14 +898,50 @@ pub async fn earliest_available_block<P: Provider<AnyNetwork>>(
     head: BlockNumber,
     rate_limit_rps: Option<u32>,
 ) -> Result<BlockNumber> {
+    earliest_available(head, rate_limit_rps, |block| async move {
+        provider.get_block_by_number(BlockNumberOrTag::Number(block)).await.map(|b| b.is_some())
+    })
+    .await
+}
+
+/// Returns the oldest block whose state `provider` still serves, at most `head`.
+///
+/// Probes the zero address's nonce the same way [`earliest_available_block`] probes blocks. A
+/// minimal node prunes state history to a distance from the tip but deletes block bodies a whole
+/// static file at a time, so its state floor can sit far above its block floor. Reth rejects
+/// pruned state with code 4444 without naming the earliest available block, so this searches.
+pub async fn earliest_available_state<P: Provider<AnyNetwork>>(
+    provider: &P,
+    head: BlockNumber,
+    rate_limit_rps: Option<u32>,
+) -> Result<BlockNumber> {
+    earliest_available(head, rate_limit_rps, |block| async move {
+        provider.get_transaction_count(Address::ZERO).block_id(block.into()).await.map(|_| true)
+    })
+    .await
+}
+
+/// Finds the oldest block at most `head` for which `request` reports the data available, as
+/// described on [`earliest_available_block`].
+async fn earliest_available<F, Fut>(
+    head: BlockNumber,
+    rate_limit_rps: Option<u32>,
+    request: F,
+) -> Result<BlockNumber>
+where
+    F: Fn(BlockNumber) -> Fut,
+    Fut: Future<Output = Result<bool, TransportError>>,
+{
     let interval =
         rate_limit_rps.map(|rps| std::time::Duration::from_secs_f64(1.0 / rps.max(1) as f64));
-    let probe = |block: BlockNumber| async move {
-        if let Some(interval) = interval {
-            tokio::time::sleep(interval).await;
+    let probe = |block: BlockNumber| {
+        let response = request(block);
+        async move {
+            if let Some(interval) = interval {
+                tokio::time::sleep(interval).await;
+            }
+            classify_probe(response.await)
         }
-        let response = provider.get_block_by_number(BlockNumberOrTag::Number(block)).await;
-        classify_probe(response.map(|block| block.is_some()))
     };
 
     match probe(0).await? {
@@ -910,7 +985,10 @@ fn classify_probe(response: Result<bool, TransportError>) -> Result<Probe> {
         Err(err) => {
             if let Some(resp) = err.as_error_resp() {
                 let earliest = parse_earliest_available(&resp.message);
-                if resp.code == PRUNED_HISTORY_ERROR_CODE || earliest.is_some() {
+                // Reth releases before 2026-10-23 report pruned state as an internal error.
+                let pruned_state = resp.message.starts_with("state at block #") &&
+                    resp.message.ends_with("pruned");
+                if resp.code == PRUNED_HISTORY_ERROR_CODE || earliest.is_some() || pruned_state {
                     return Ok(Probe::Pruned(earliest));
                 }
             }
@@ -1016,6 +1094,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     use_tempo: bool,
     /// Oldest block both nodes still serve.
     history_floor: BlockNumber,
+    /// Whether either node runs with `--minimal` pruning.
+    minimal: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -1035,6 +1115,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_ots: false,
             use_tempo: false,
             history_floor: 0,
+            minimal: false,
             rate_limit_rps: None,
         }
     }
@@ -1099,6 +1180,14 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Enables or disables skipping what a `--minimal` node prunes: lookups by transaction hash
+    /// and anything read from receipts. Pair it with a history floor above both nodes' pruned
+    /// state, see [`earliest_available_state`].
+    pub const fn with_minimal(mut self, is_enabled: bool) -> Self {
+        self.minimal = is_enabled;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -1120,6 +1209,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_ots: self.use_ots,
             use_tempo: self.use_tempo,
             history_floor: self.history_floor,
+            minimal: self.minimal,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }
@@ -1178,10 +1268,28 @@ mod tests {
             classify_probe(Err(error_resp(4444, "pruned history unavailable"))).unwrap(),
             Probe::Pruned(None)
         );
+        assert_eq!(
+            classify_probe(Err(error_resp(-32603, "state at block #2 is pruned"))).unwrap(),
+            Probe::Pruned(None)
+        );
         // Rate limits, transport failures and other errors must not count as pruned.
         assert!(classify_probe(Err(error_resp(429, "too many requests"))).is_err());
         assert!(classify_probe(Err(error_resp(-32000, "internal error"))).is_err());
         assert!(classify_probe(Err(TransportErrorKind::backend_gone())).is_err());
+    }
+
+    #[tokio::test]
+    async fn searches_for_pruned_state_floor() {
+        let floor = earliest_available(1_000, None, |block| async move {
+            if block >= 637 {
+                Ok(true)
+            } else {
+                Err(error_resp(4444, &format!("state at block #{block} is pruned")))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(floor, 637);
     }
 
     #[test]

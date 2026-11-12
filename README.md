@@ -17,6 +17,7 @@ Options:
       --use-execution-witness    Whether to compare `debug_executionWitness` for the newest tested block
       --use-ots                  Whether to query Otterscan's `ots` namespace
       --use-tempo                Whether to query Tempo's `tempo` namespace
+      --minimal                  Whether either node runs with `--minimal` pruning
       --timeout <TIMEOUT>        Maximum time to wait for syncing in seconds [default: 300]
       --rate-limit <RATE_LIMIT>  Maximum requests per second (rate limit)
   -h, --help                     Print help
