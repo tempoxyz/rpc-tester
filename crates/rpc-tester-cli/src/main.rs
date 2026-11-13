@@ -175,6 +175,7 @@ async fn main() -> eyre::Result<()> {
                 Duration::from_secs(args.ws_timeout),
             )
             .await?
+            .with_rate_limit(args.rate_limit)
             .run()
             .await
         }

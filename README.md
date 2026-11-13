@@ -45,5 +45,6 @@ grouped by block in index order, and each block's items must match the node's ow
 `eth_getBlockByNumber`, `eth_getLogs` and `eth_getBlockReceipts` responses as well as the other
 node's stream. Blocks replaced by a reorg are skipped. Pending transaction and `syncing` streams
 are node-local, so they are only checked for a decodable first message within `--ws-timeout`
-(`syncing` falls back to `eth_syncing`, since clients may only emit on status changes). A stream
-both nodes reject with the same error is skipped.
+(`syncing` falls back to `eth_syncing`, since clients may only emit on status changes). A pending
+transaction stream without a message only fails when the other node's stream delivered one, so
+idle chains pass. A stream both nodes reject with the same error is skipped.

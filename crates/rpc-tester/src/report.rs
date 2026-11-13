@@ -45,7 +45,7 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
 
                     // While results are different, we only report it as error if __RPC1__ is
                     // missing/mismatching any element against RPC2.
-                    if let Some(diffs) = verify_missing_or_mismatch(rpc1, rpc2) {
+                    if let Some(diffs) = verify_missing_or_mismatch(rpc1, rpc2, ["rpc1", "rpc2"]) {
                         if passed_title {
                             passed_title = false;
                             println!("\n{title} ❌");
@@ -54,6 +54,18 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
                         if let Some(args) = args {
                             println!("      args: {args}");
                         }
+                        println!("{diffs}");
+                    }
+                }
+                Err(TestError::StreamDiff { stream, http }) => {
+                    if let Some(diffs) =
+                        verify_missing_or_mismatch(stream, http, ["stream", "http"])
+                    {
+                        if passed_title {
+                            passed_title = false;
+                            println!("\n{title} ❌");
+                        }
+                        println!("    {name}: ❌ Failure");
                         println!("{diffs}");
                     }
                 }
@@ -127,12 +139,13 @@ fn filter_simulated_blocks(mut value: Value) -> Value {
     value
 }
 
-/// Verifies if there is any missing field/element from rpc1 comparing it to rpc2.
+/// Verifies if there is any missing field/element from rpc1 comparing it to rpc2. The sides are
+/// named after `labels` in the returned diff.
 ///
 /// Note that the superset semantics of `assert_json_include` only apply to object keys. Arrays
 /// are compared positionally: extra trailing elements in rpc1 are tolerated, but an extra element
 /// anywhere else shifts subsequent indices and fails.
-fn verify_missing_or_mismatch(rpc1: Value, rpc2: Value) -> Option<String> {
+fn verify_missing_or_mismatch(rpc1: Value, rpc2: Value, labels: [&str; 2]) -> Option<String> {
     let default_panic_hook = std::panic::take_hook();
 
     // Suppress the panic stderr output
@@ -150,8 +163,8 @@ fn verify_missing_or_mismatch(rpc1: Value, rpc2: Value) -> Option<String> {
             .downcast_ref::<&str>()
             .map(|s| s.to_string())
             .unwrap_or_else(|| err.downcast_ref::<String>().cloned().expect("should"))
-            .replace("actual", "actual (rpc1)")
-            .replace("expected", "expected (rpc2)");
+            .replace("actual", &format!("actual ({})", labels[0]))
+            .replace("expected", &format!("expected ({})", labels[1]));
         return Some(err_msg);
     }
     None
@@ -231,6 +244,13 @@ mod tests {
             args: None,
         };
         assert!(report(vec![("t".to_string(), vec![(method, Err(logs_differ))])]).is_err());
+
+        // A stream is compared with its node's HTTP response like rpc1 with rpc2.
+        let stream_diff = |stream| TestError::StreamDiff { stream, http: json!({ "a": 1 }) };
+        let superset = stream_diff(json!({ "a": 1, "extra": 2 }));
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(superset))])]).is_ok());
+        let missing = stream_diff(json!({ "extra": 2 }));
+        assert!(report(vec![("t".to_string(), vec![("m".to_string(), Err(missing))])]).is_err());
 
         // Error mismatches and node errors always fail.
         let err_diff =

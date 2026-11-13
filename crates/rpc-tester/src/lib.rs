@@ -16,6 +16,7 @@ pub use sampling::{
 /// Equality rpc test error
 enum TestError {
     Diff { rpc1: serde_json::Value, rpc2: serde_json::Value, args: Option<String> },
+    StreamDiff { stream: serde_json::Value, http: serde_json::Value },
     ErrDiff { rpc1: String, rpc2: String, args: Option<String> },
     Rpc1Err(String),
     Rpc2Err(String),

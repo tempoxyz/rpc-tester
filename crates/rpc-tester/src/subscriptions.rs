@@ -26,7 +26,7 @@ use std::{
 };
 use tokio::{
     sync::broadcast::error::RecvError,
-    time::{sleep_until, timeout, Instant},
+    time::{sleep, sleep_until, timeout, Instant},
 };
 use tracing::{info, warn};
 
@@ -54,6 +54,8 @@ pub struct SubscriptionTester<P> {
     num_blocks: u64,
     /// Maximum wait for the next head, and for the first message of a node-local stream.
     timeout: Duration,
+    /// Maximum HTTP requests per second and node, unlimited if `None`.
+    rate_limit_rps: Option<u32>,
 }
 
 impl<P> SubscriptionTester<P>
@@ -76,7 +78,15 @@ where
         let ws2 = RootProvider::<AnyNetwork>::connect(ws2)
             .await
             .map_err(|err| eyre::eyre!("failed to connect to ws2: {err}"))?;
-        Ok(Self { rpc1, rpc2, ws1, ws2, num_blocks, timeout })
+        Ok(Self { rpc1, rpc2, ws1, ws2, num_blocks, timeout, rate_limit_rps: None })
+    }
+
+    /// Sets the rate limit in requests per second for the HTTP requests the stream items are
+    /// compared with. Each node is queried at this rate, so an endpoint serving both roles
+    /// receives up to twice as many. If `None`, no rate limiting is applied.
+    pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
+        self.rate_limit_rps = rps;
+        self
     }
 
     /// Collects every stream over the next `num_blocks` blocks (plus one, so items for the last
@@ -103,11 +113,7 @@ where
         let (collected1, collected2, liveness1, liveness2) =
             tokio::join!(collect1, collect2, liveness1, liveness2);
 
-        for (node, results) in [("rpc1", liveness1), ("rpc2", liveness2)] {
-            for (stream, result) in results {
-                general.push((format!("{node} {}", stream.name()), result));
-            }
-        }
+        general.extend(liveness_results(liveness1, liveness2, self.timeout));
 
         let streams1 = NodeStreams::analyze("rpc1", collected1, &mut general);
         let streams2 = NodeStreams::analyze("rpc2", collected2, &mut general);
@@ -125,13 +131,15 @@ where
         streams1: Option<&NodeStreams>,
         streams2: Option<&NodeStreams>,
     ) -> ReportResults {
+        let interval =
+            self.rate_limit_rps.map(|rps| Duration::from_secs_f64(1.0 / rps.max(1) as f64));
         let mut results = Vec::new();
         for number in window {
             let mut block_results = Vec::new();
 
             let (http1, http2) = tokio::join!(
-                OptionFuture::from(streams1.map(|s| s.canonical(&self.rpc1, number))),
-                OptionFuture::from(streams2.map(|s| s.canonical(&self.rpc2, number))),
+                OptionFuture::from(streams1.map(|s| s.canonical(&self.rpc1, number, interval))),
+                OptionFuture::from(streams2.map(|s| s.canonical(&self.rpc2, number, interval))),
             );
             let mut compared = [None, None];
             for (index, (node, streams, http)) in
@@ -143,8 +151,8 @@ where
                         compared[index] =
                             streams.compare_http(node, number, &http, &mut block_results);
                     }
-                    Err(err) => block_results.push((
-                        format!("{node} eth_getBlockByNumber"),
+                    Err((method, err)) => block_results.push((
+                        format!("{node} {method}"),
                         Err(node_err(node, format!("{err:?}"))),
                     )),
                 }
@@ -390,6 +398,16 @@ fn recv_error(err: RecvError) -> String {
     }
 }
 
+/// Outcome of the liveness check of a node-local stream.
+enum Liveness {
+    /// The first message arrived and decodes, or `eth_syncing` served the initial state.
+    Alive,
+    /// No message arrived in time, which [`liveness_results`] judges against the other node.
+    Silent,
+    /// The stream closed, or its first message does not decode.
+    Failed(TestError),
+}
+
 /// Checks that each node-local stream is alive and its first message decodes.
 ///
 /// `syncing` only emits on status changes in some clients, so without a message the node's
@@ -398,7 +416,7 @@ async fn liveness<P: Provider<AnyNetwork>>(
     rpc: &P,
     subs: NodeSubscriptions,
     wait: Duration,
-) -> Vec<(Stream, Result<(), TestError>)> {
+) -> Vec<(Stream, Liveness)> {
     let first_messages = subs
         .into_iter()
         .map(|(stream, mut sub)| async move { (stream, timeout(wait, sub.recv()).await) });
@@ -406,25 +424,72 @@ async fn liveness<P: Provider<AnyNetwork>>(
     let mut results = Vec::new();
     for (stream, message) in join_all(first_messages.collect::<Vec<_>>()).await {
         let result = match message {
-            Ok(Ok(message)) => check_message(stream, &message)
-                .map_err(|err| TestError::Rpc1Err(format!("undecodable message {message}: {err}"))),
-            Ok(Err(err)) => Err(TestError::Rpc1Err(recv_error(err))),
+            Ok(Ok(message)) => match check_message(stream, &message) {
+                Ok(()) => Liveness::Alive,
+                Err(err) => Liveness::Failed(TestError::Rpc1Err(format!(
+                    "undecodable message {message}: {err}"
+                ))),
+            },
+            Ok(Err(err)) => Liveness::Failed(TestError::Rpc1Err(recv_error(err))),
             Err(_) if stream == Stream::Syncing => {
                 match rpc.raw_request::<_, SyncStatus>("eth_syncing".into(), ()).await {
                     Ok(status) => {
                         info!(?status, "no syncing message, eth_syncing serves the initial state");
-                        Ok(())
+                        Liveness::Alive
                     }
-                    Err(err) => Err(TestError::Rpc1Err(format!(
+                    Err(err) => Liveness::Failed(TestError::Rpc1Err(format!(
                         "no message within {wait:?} and eth_syncing failed: {err:?}"
                     ))),
                 }
             }
-            Err(_) => Err(TestError::Rpc1Err(format!("no message within {wait:?}"))),
+            Err(_) => Liveness::Silent,
         };
         results.push((stream, result));
     }
     results.sort_by_key(|(stream, _)| Stream::ALL.iter().position(|s| s == stream));
+    results
+}
+
+/// Turns the liveness outcomes of both nodes into results. A silent stream only fails when the
+/// other node's stream delivered a message: without pending transactions, such as on an idle
+/// chain, both nodes are equally quiet, which is no difference between them.
+fn liveness_results(
+    liveness1: Vec<(Stream, Liveness)>,
+    liveness2: Vec<(Stream, Liveness)>,
+    wait: Duration,
+) -> Vec<(MethodName, Result<(), TestError>)> {
+    let alive = |outcomes: &[(Stream, Liveness)]| {
+        outcomes
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, Liveness::Alive))
+            .map(|(stream, _)| *stream)
+            .collect::<HashSet<_>>()
+    };
+    let (alive1, alive2) = (alive(&liveness1), alive(&liveness2));
+
+    let mut results = Vec::new();
+    for (node, outcomes, other_alive) in [("rpc1", liveness1, alive2), ("rpc2", liveness2, alive1)]
+    {
+        for (stream, outcome) in outcomes {
+            let result = match outcome {
+                Liveness::Alive => Ok(()),
+                Liveness::Failed(err) => Err(err),
+                Liveness::Silent if other_alive.contains(&stream) => {
+                    Err(TestError::Rpc1Err(format!("no message within {wait:?}")))
+                }
+                Liveness::Silent => {
+                    warn!(
+                        node,
+                        stream = stream.name(),
+                        ?wait,
+                        "no message on either node, skipped"
+                    );
+                    Ok(())
+                }
+            };
+            results.push((format!("{node} {}", stream.name()), result));
+        }
+    }
     results
 }
 
@@ -538,30 +603,35 @@ impl NodeStreams {
     }
 
     /// Fetches the node's canonical block `number` and, for the streams it serves, the block's
-    /// logs and receipts over HTTP.
+    /// logs and receipts over HTTP, waiting `interval` before each request. An error comes with
+    /// the method that failed.
     async fn canonical<P: Provider<AnyNetwork>>(
         &self,
         rpc: &P,
         number: BlockNumber,
-    ) -> Result<CanonicalBlock, TransportError> {
-        let block: Value =
-            rpc.raw_request("eth_getBlockByNumber".into(), (format!("{number:#x}"), false)).await?;
+        interval: Option<Duration>,
+    ) -> Result<CanonicalBlock, (&'static str, TransportError)> {
+        let request = |method: &'static str, params: Value| async move {
+            if let Some(interval) = interval {
+                sleep(interval).await;
+            }
+            rpc.raw_request::<_, Value>(method.into(), params).await.map_err(|err| (method, err))
+        };
+
+        let block = request("eth_getBlockByNumber", json!([format!("{number:#x}"), false])).await?;
         let hash = block
             .get("hash")
             .and_then(|hash| serde_json::from_value::<B256>(hash.clone()).ok())
             .ok_or_else(|| {
-                TransportError::local_usage_str(&format!(
-                    "block {number} not found or without a hash"
-                ))
+                let err = format!("block {number} not found or without a hash");
+                ("eth_getBlockByNumber", TransportError::local_usage_str(&err))
             })?;
         let logs = match self.logs {
-            Some(_) => {
-                Some(rpc.raw_request("eth_getLogs".into(), [json!({ "blockHash": hash })]).await?)
-            }
+            Some(_) => Some(request("eth_getLogs", json!([{ "blockHash": hash }])).await?),
             None => None,
         };
         let receipts = match self.receipts {
-            Some(_) => Some(rpc.raw_request("eth_getBlockReceipts".into(), [hash]).await?),
+            Some(_) => Some(request("eth_getBlockReceipts", json!([hash])).await?),
             None => None,
         };
         Ok(CanonicalBlock { hash, block, logs, receipts })
@@ -599,25 +669,29 @@ impl NodeStreams {
                 header.remove(*field);
             }
         }
-        results.push(diff(
+        results.push(against_http(diff(
             format!("{node} newHeads vs eth_getBlockByNumber"),
             head.clone(),
             header,
-        ));
+        )));
 
         let logs = self.logs.as_ref().zip(http.logs.as_ref()).and_then(|(logs, expected)| {
             let logs = block_items(logs, http.hash)?;
-            results.push(diff_items(format!("{node} logs vs eth_getLogs"), &logs, expected));
+            results.push(against_http(diff_items(
+                format!("{node} logs vs eth_getLogs"),
+                &logs,
+                expected,
+            )));
             Some(logs)
         });
         let receipts =
             self.receipts.as_ref().zip(http.receipts.as_ref()).and_then(|(receipts, expected)| {
                 let receipts = block_items(receipts, http.hash)?;
-                results.push(diff_items(
+                results.push(against_http(diff_items(
                     format!("{node} transactionReceipts vs eth_getBlockReceipts"),
                     &receipts,
                     expected,
-                ));
+                )));
                 Some(receipts)
             });
 
@@ -875,6 +949,18 @@ fn diff_items(
     diff(name, actual.clone(), expected.clone())
 }
 
+/// Marks a difference as one between a node's stream and its own HTTP response, so the report
+/// names the sides as such instead of as rpc1 and rpc2.
+fn against_http(
+    (name, result): (MethodName, Result<(), TestError>),
+) -> (MethodName, Result<(), TestError>) {
+    let result = result.map_err(|err| match err {
+        TestError::Diff { rpc1, rpc2, .. } => TestError::StreamDiff { stream: rpc1, http: rpc2 },
+        err => err,
+    });
+    (name, result)
+}
+
 fn node_err(node: &str, err: String) -> TestError {
     if node == "rpc1" {
         TestError::Rpc1Err(format!("rpc1: {err}"))
@@ -1025,6 +1111,33 @@ mod tests {
         let detailed = json!({ "syncing": true, "status": { "currentBlock": "0x1" } });
         assert!(check_message(Stream::Syncing, &detailed).is_ok());
         assert!(check_message(Stream::Syncing, &json!({ "status": {} })).is_err());
+    }
+
+    #[test]
+    fn silent_streams_fail_only_against_a_live_one() {
+        let pending = Stream::PendingTransactions;
+        let wait = Duration::from_secs(1);
+        let results = |outcome1, outcome2| {
+            liveness_results(vec![(pending, outcome1)], vec![(pending, outcome2)], wait)
+        };
+
+        let quiet = results(Liveness::Silent, Liveness::Silent);
+        assert!(quiet.iter().all(|(_, result)| result.is_ok()));
+
+        let rpc1_silent = results(Liveness::Silent, Liveness::Alive);
+        assert_eq!(rpc1_silent[0].0, "rpc1 newPendingTransactions");
+        assert!(
+            matches!(&rpc1_silent[0].1, Err(TestError::Rpc1Err(err)) if err == "no message within 1s")
+        );
+        assert!(rpc1_silent[1].1.is_ok());
+
+        let rpc2_silent = results(Liveness::Alive, Liveness::Silent);
+        assert!(rpc2_silent[0].1.is_ok());
+        assert!(rpc2_silent[1].1.is_err());
+
+        // A stream only rpc1 serves has nothing to be judged against.
+        let alone = liveness_results(vec![(pending, Liveness::Silent)], Vec::new(), wait);
+        assert!(alone[0].1.is_ok());
     }
 
     #[test]
