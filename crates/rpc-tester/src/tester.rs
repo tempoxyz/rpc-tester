@@ -863,7 +863,7 @@ fn sample_key(tx: &JsonValue) -> JsonValue {
 ///
 /// Only JSON-RPC error responses are compared (by code and message); transport-level failures
 /// such as timeouts are never treated as agreement.
-fn errors_match(e1: &TransportError, e2: &TransportError) -> bool {
+pub(crate) fn errors_match(e1: &TransportError, e2: &TransportError) -> bool {
     match (e1.as_error_resp(), e2.as_error_resp()) {
         // The data field must match too: reverts surface as identical code/message pairs with
         // the revert bytes in data, and differing revert data is genuine execution divergence.

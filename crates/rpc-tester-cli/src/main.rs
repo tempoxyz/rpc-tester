@@ -5,6 +5,7 @@ use alloy_rpc_types::SyncStatus;
 use clap::Parser;
 use rpc_tester::{
     earliest_available_block, earliest_available_state, historical_blocks, RpcTester,
+    SubscriptionTester,
 };
 use std::{
     ops::RangeInclusive,
@@ -73,6 +74,22 @@ pub struct CliArgs {
     #[arg(long)]
     pub minimal: bool,
 
+    /// WS URL of rpc1's node. Enables the `eth_subscribe` checks, which need `--ws2` too.
+    ///
+    /// Heads, logs and receipts are collected for `--num-blocks` new blocks on both nodes and
+    /// compared with each other and with each node's HTTP responses; pending transaction and
+    /// syncing streams are only checked for liveness.
+    #[arg(long, value_name = "WS_URL1", requires = "ws2")]
+    pub ws1: Option<Url>,
+
+    /// WS URL of rpc2's node.
+    #[arg(long, value_name = "WS_URL2", requires = "ws1")]
+    pub ws2: Option<Url>,
+
+    /// Maximum time to wait for the next subscription message in seconds.
+    #[arg(long, value_name = "WS_TIMEOUT", default_value = "60")]
+    pub ws_timeout: u64,
+
     /// Maximum time to wait for syncing in seconds
     #[arg(long, value_name = "TIMEOUT", default_value = "300")]
     pub timeout: u64,
@@ -92,11 +109,11 @@ async fn main() -> eyre::Result<()> {
     let rpc1 = ProviderBuilder::new()
         .disable_recommended_fillers()
         .network::<AnyNetwork>()
-        .connect_http(args.rpc1);
+        .connect_http(args.rpc1.clone());
     let rpc2 = ProviderBuilder::new()
         .disable_recommended_fillers()
         .network::<AnyNetwork>()
-        .connect_http(args.rpc2);
+        .connect_http(args.rpc2.clone());
 
     let block_range =
         wait_for_readiness(&rpc1, &rpc2, args.num_blocks, Duration::from_secs(args.timeout))
@@ -124,7 +141,7 @@ async fn main() -> eyre::Result<()> {
     }
     let block_range = (*block_range.start()).max(history_floor)..=head;
 
-    let tester = RpcTester::builder(rpc1, rpc2)
+    let tester = RpcTester::builder(rpc1.clone(), rpc2.clone())
         .with_tracing(args.use_tracing)
         .with_reth(args.use_reth)
         .with_all_txes(args.use_all_txes)
@@ -145,10 +162,26 @@ async fn main() -> eyre::Result<()> {
 
     // Run both suites to completion before failing so a diff in one does not hide the other.
     let range_result = tester.run(block_range).await;
-    if !historical.is_empty() {
-        tester.run_blocks(historical).await?;
-    }
-    range_result
+    let historical_result =
+        if historical.is_empty() { Ok(()) } else { tester.run_blocks(historical).await };
+    let subscription_result = match (args.ws1, args.ws2) {
+        (Some(ws1), Some(ws2)) => {
+            SubscriptionTester::connect(
+                rpc1,
+                rpc2,
+                ws1.as_str(),
+                ws2.as_str(),
+                args.num_blocks,
+                Duration::from_secs(args.ws_timeout),
+            )
+            .await?
+            .with_rate_limit(args.rate_limit)
+            .run()
+            .await
+        }
+        _ => Ok(()),
+    };
+    range_result.and(historical_result).and(subscription_result)
 }
 
 /// Waits until rpc1 is synced to the tip and returns a valid block range to test against rpc2.
