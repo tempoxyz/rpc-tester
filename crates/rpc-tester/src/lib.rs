@@ -6,6 +6,8 @@ pub mod get_logs;
 mod tester;
 pub use tester::{earliest_available_block, earliest_available_state, RpcTester};
 mod report;
+mod subscriptions;
+pub use subscriptions::SubscriptionTester;
 mod sampling;
 pub use sampling::{
     historical_blocks, DEEP_STRATA, NEAR_WINDOW_MAX_OFFSET, NEAR_WINDOW_MIN_OFFSET,

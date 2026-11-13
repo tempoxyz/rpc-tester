@@ -7,7 +7,7 @@
 use alloy_node_bindings::{Anvil, AnvilInstance};
 use alloy_primitives::B256;
 use alloy_provider::{network::AnyNetwork, Provider, ProviderBuilder};
-use rpc_tester::RpcTester;
+use rpc_tester::{RpcTester, SubscriptionTester};
 use serde_json::json;
 use std::time::Duration;
 
@@ -86,4 +86,34 @@ async fn missing_block_errors() {
     let tester = RpcTester::builder(provider(&anvil), provider(&anvil)).build();
     let result = tester.run_blocks([head + 1000]).await;
     assert!(result.is_err(), "requesting a block beyond the tip must error, not panic");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_node_subscriptions_pass() {
+    let anvil = Anvil::new().block_time(1).try_spawn().expect("anvil must be installed");
+
+    // Keeps the mempool and blocks busy so the pending, log and receipt streams carry messages.
+    let sender = provider(&anvil);
+    let traffic = tokio::spawn(async move {
+        loop {
+            let tx = json!({ "from": ALICE, "data": LOG_EMITTER_INIT_CODE });
+            let _: Result<B256, _> = sender.raw_request("eth_sendTransaction".into(), [tx]).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+
+    let ws = anvil.ws_endpoint();
+    let tester = SubscriptionTester::connect(
+        provider(&anvil),
+        provider(&anvil),
+        &ws,
+        &ws,
+        3,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("connect to anvil over ws");
+    let result = tester.run().await;
+    traffic.abort();
+    result.expect("same node streams must agree with themselves");
 }
