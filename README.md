@@ -18,6 +18,7 @@ Options:
       --use-ots                  Whether to query Otterscan's `ots` namespace
       --use-tempo                Whether to query Tempo's `tempo` namespace
       --minimal                  Whether either node runs with `--minimal` pruning
+      --skip-historical-state    Skip transaction replays at the parent block (`eth_call`, `eth_estimateGas`, simulations and traced calls) and contract code and storage reads at the tested block
       --ws1 <WS_URL1>            WS URL of rpc1's node. Enables the `eth_subscribe` checks, which need `--ws2` too
       --ws2 <WS_URL2>            WS URL of rpc2's node
       --ws-timeout <WS_TIMEOUT>  Maximum time to wait for the next subscription message in seconds [default: 60]
