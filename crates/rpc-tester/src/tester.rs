@@ -74,6 +74,9 @@ pub struct RpcTester<P: Provider<AnyNetwork>> {
     /// and keeps receipts for only the newest 64 blocks, so lookups by hash and anything read from
     /// receipts are skipped.
     minimal: bool,
+    /// Whether to skip replaying transactions at their parent block and reading contract code and
+    /// storage at the tested block, which read account state at a past block.
+    skip_historical_state: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
     /// Last timestamp for rate limiting.
@@ -248,9 +251,12 @@ where
                     rpc_raw!(self, trace_call, JsonValue, parity_call_args),
                     rpc_raw!(self, tempo_simulateV1, JsonValue, tempo_simulate_args),
                 ];
-                tests.extend(exec_calls);
+                // Replays and state reads at a past block are skipped with --skip-historical-state.
+                if !self.skip_historical_state {
+                    tests.extend(exec_calls);
+                }
 
-                if self.use_tempo {
+                if self.use_tempo && !self.skip_historical_state {
                     // Replays with the transaction's own fees, fee token and authorizations, which
                     // the fee-free replays drop. Calls, estimates and traced calls still resolve
                     // and validate the fee token but skip fee collection, so only the simulation
@@ -279,7 +285,7 @@ where
                     tests.extend(fee_calls);
                 }
 
-                if !self.skip_extended_eth {
+                if !self.skip_extended_eth && !self.skip_historical_state {
                     // Simulation builds a block around the call, with receipts, logs and
                     // synthetic transfer logs that `eth_call` does not return.
                     let simulate_args = (
@@ -312,7 +318,7 @@ where
                         .and_then(JsonValue::as_str)
                         .and_then(|to| to.parse().ok()),
                 };
-                if let Some(address) = state_address {
+                if let Some(address) = state_address.filter(|_| !self.skip_historical_state) {
                     #[rustfmt::skip]
                     let state_calls = vec![
                         rpc_with_block!(self, get_code_at, address; block_id),
@@ -1096,6 +1102,8 @@ pub struct RpcTesterBuilder<P: Provider<AnyNetwork>> {
     history_floor: BlockNumber,
     /// Whether either node runs with `--minimal` pruning.
     minimal: bool,
+    /// Whether to skip calls that read account state at a past block.
+    skip_historical_state: bool,
     /// Maximum requests per second for rate limiting.
     rate_limit_rps: Option<u32>,
 }
@@ -1116,6 +1124,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_tempo: false,
             history_floor: 0,
             minimal: false,
+            skip_historical_state: false,
             rate_limit_rps: None,
         }
     }
@@ -1188,6 +1197,13 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
         self
     }
 
+    /// Enables or disables skipping transaction replays at the parent block and contract code and
+    /// storage reads at the tested block.
+    pub const fn skip_historical_state(mut self, skip: bool) -> Self {
+        self.skip_historical_state = skip;
+        self
+    }
+
     /// Sets the rate limit in requests per second.
     /// If None, no rate limiting is applied.
     pub const fn with_rate_limit(mut self, rps: Option<u32>) -> Self {
@@ -1210,6 +1226,7 @@ impl<P: Provider<AnyNetwork>> RpcTesterBuilder<P> {
             use_tempo: self.use_tempo,
             history_floor: self.history_floor,
             minimal: self.minimal,
+            skip_historical_state: self.skip_historical_state,
             rate_limit_rps: self.rate_limit_rps,
             last_request_time: tokio::sync::Mutex::new(std::time::Instant::now()),
         }

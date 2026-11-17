@@ -74,6 +74,14 @@ pub struct CliArgs {
     #[arg(long)]
     pub minimal: bool,
 
+    /// Skip transaction replays at the parent block (`eth_call`, `eth_estimateGas`, simulations
+    /// and traced calls) and contract code and storage reads at the tested block.
+    ///
+    /// For a node whose history index may not cover accounts unchanged since before its earliest
+    /// changeset, such as one restored from a snapshot without its indices.
+    #[arg(long)]
+    pub skip_historical_state: bool,
+
     /// WS URL of rpc1's node. Enables the `eth_subscribe` checks, which need `--ws2` too.
     ///
     /// Heads, logs and receipts are collected for `--num-blocks` new blocks on both nodes and
@@ -152,6 +160,7 @@ async fn main() -> eyre::Result<()> {
         .with_tempo(args.use_tempo)
         .with_history_floor(history_floor)
         .with_minimal(args.minimal)
+        .skip_historical_state(args.skip_historical_state)
         .with_rate_limit(args.rate_limit)
         .build();
 
