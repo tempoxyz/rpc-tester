@@ -1,6 +1,7 @@
 //! Writes a report from [`RpcTester`] run results.
 
 use super::{ReportResults, TestError};
+use alloy_primitives::hex;
 use assert_json_diff::assert_json_include;
 use serde_json::Value;
 
@@ -38,7 +39,10 @@ pub(crate) fn report(results_by_block: ReportResults) -> eyre::Result<()> {
                     let (rpc1, rpc2) = if RECEIPT_METHODS.contains(&name.as_str()) {
                         (filter_ignored_fields(rpc1), filter_ignored_fields(rpc2))
                     } else if name == "eth_simulateV1" {
-                        (filter_simulated_blocks(rpc1), filter_simulated_blocks(rpc2))
+                        let (mut rpc1, rpc2) =
+                            (filter_simulated_blocks(rpc1), filter_simulated_blocks(rpc2));
+                        align_simulated_extra_data(&mut rpc1, &rpc2);
+                        (rpc1, rpc2)
                     } else {
                         (rpc1, rpc2)
                     };
@@ -137,6 +141,34 @@ fn filter_simulated_blocks(mut value: Value) -> Value {
         }
     }
     value
+}
+
+/// Copies rpc2's `extraData` into each rpc1 simulated block that leaves it empty, and grows that
+/// block's `size` by the bytes the tag adds to its RLP encoding. Newer reth leaves `extraData`
+/// empty like geth (paradigmxyz/reth#28652), while reth up to v2.11 copies the parent block's
+/// builder tag. Any other `size` difference is still compared.
+fn align_simulated_extra_data(rpc1: &mut Value, rpc2: &Value) {
+    let (Some(blocks1), Some(blocks2)) = (rpc1.as_array_mut(), rpc2.as_array()) else { return };
+    for (block1, block2) in blocks1.iter_mut().zip(blocks2) {
+        if block1.get("extraData").and_then(Value::as_str) != Some("0x") {
+            continue
+        }
+        let Some(extra_data) = block2.get("extraData").and_then(Value::as_str) else { continue };
+        let Ok(tag) = hex::decode(extra_data) else { continue };
+        let size = block1.get("size").and_then(Value::as_str);
+        let Some(Ok(size)) =
+            size.map(|size| u64::from_str_radix(size.trim_start_matches("0x"), 16))
+        else {
+            continue
+        };
+        // An empty string and a single byte below 0x80 both encode as one byte.
+        let added = match tag.as_slice() {
+            [byte] if *byte < 0x80 => 0,
+            tag => tag.len() as u64,
+        };
+        block1["size"] = format!("{size_with_tag:#x}", size_with_tag = size + added).into();
+        block1["extraData"] = extra_data.into();
+    }
 }
 
 /// Verifies if there is any missing field/element from rpc1 comparing it to rpc2. The sides are
@@ -243,7 +275,26 @@ mod tests {
             rpc2: simulated("00", "0xff"),
             args: None,
         };
-        assert!(report(vec![("t".to_string(), vec![(method, Err(logs_differ))])]).is_err());
+        assert!(report(vec![("t".to_string(), vec![(method.clone(), Err(logs_differ))])]).is_err());
+
+        // An empty simulated `extraData` passes against the parent's builder tag when `size`
+        // differs by the tag's length...
+        let block =
+            |extra_data: &str, size: &str| json!([{ "extraData": extra_data, "size": size }]);
+        let tag = "0x546974616e2028746974616e6275696c6465722e78797a29";
+        let empty_extra_data =
+            TestError::Diff { rpc1: block("0x", "0x291"), rpc2: block(tag, "0x2a9"), args: None };
+        let results = vec![(method.clone(), Err(empty_extra_data))];
+        assert!(report(vec![("t".to_string(), results)]).is_ok());
+
+        // ...but fails when `size` differs by anything else, or both tags are set and differ.
+        let size_differs =
+            TestError::Diff { rpc1: block("0x", "0x292"), rpc2: block(tag, "0x2a9"), args: None };
+        let results = vec![(method.clone(), Err(size_differs))];
+        assert!(report(vec![("t".to_string(), results)]).is_err());
+        let tags_differ =
+            TestError::Diff { rpc1: block("0x01", "0x2a9"), rpc2: block(tag, "0x2a9"), args: None };
+        assert!(report(vec![("t".to_string(), vec![(method, Err(tags_differ))])]).is_err());
 
         // A stream is compared with its node's HTTP response like rpc1 with rpc2.
         let stream_diff = |stream| TestError::StreamDiff { stream, http: json!({ "a": 1 }) };
